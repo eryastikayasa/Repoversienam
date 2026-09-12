@@ -15,6 +15,7 @@
 
 static const char *TAG = "APP_STARTUP";
 static volatile bool s_assistant_requested = false;
+static bool s_session_was_connected = false;
 
 static void on_wakeword_detected(void *ctx)
 {
@@ -83,7 +84,7 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
     ESP_LOGI(TAG, "Menunggu Wake Word sebelum membuka sesi Gemini...");
 
-    /* 6. After Wake Word, open Gemini. WebSocket remains transport-only. */
+    /* 6. Wake Word opens a transport session. WebSocket remains transport-only. */
     for (;;) {
         if (s_assistant_requested) {
             s_assistant_requested = false;
@@ -92,13 +93,29 @@ extern "C" void app_main(void)
             websocket_init();
             if (!websocket_connect()) {
                 ESP_LOGE(TAG, "WebSocket Gemini gagal start");
+                /* Keep the Wake Word gate armed so the user can try again. */
+                (void)wakeword_rearm();
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
 
-            ESP_LOGI(TAG, "PIPELINE READY:");
-            ESP_LOGI(TAG, "MIC -> Audio HAL -> Audio Engine -> WebSocket -> Gemini");
-            ESP_LOGI(TAG, "Gemini -> WebSocket -> Audio Engine -> Audio HAL -> SPEAKER");
+            ESP_LOGI(TAG, "Menunggu WebSocket CONNECTED...");
+        }
+
+        const bool connected = websocket_is_connected();
+        if (connected) {
+            if (!s_session_was_connected) {
+                s_session_was_connected = true;
+                ESP_LOGI(TAG, "PIPELINE READY:");
+                ESP_LOGI(TAG, "MIC -> Audio HAL -> Audio Engine -> WebSocket -> Gemini");
+                ESP_LOGI(TAG, "Gemini -> WebSocket -> Audio Engine -> Audio HAL -> SPEAKER");
+            }
+        } else if (s_session_was_connected) {
+            /* A completed/failed transport session returns control to Wake Word. */
+            s_session_was_connected = false;
+            s_assistant_requested = false;
+            ESP_LOGI(TAG, "Sesi Gemini berakhir -> kembali menunggu Wake Word");
+            (void)wakeword_rearm();
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
