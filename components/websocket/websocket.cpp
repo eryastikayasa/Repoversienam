@@ -27,6 +27,21 @@ extern "C" bool websocket_gemini_send_audio(esp_websocket_client_handle_t client
 extern "C" bool websocket_gemini_send_audio_stream_end(esp_websocket_client_handle_t client);
 extern "C" bool websocket_gemini_send_text(esp_websocket_client_handle_t client, const char *text);
 
+static void websocket_task_audit(void)
+{
+    TaskHandle_t task = xTaskGetHandle("websocket_task");
+    if (!task) {
+        ESP_LOGW(TAG, "TASK AUDIT websocket_task: handle belum tersedia");
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "TASK AUDIT websocket_task stack=4096B watermark=%uB priority=%u core=%d",
+             (unsigned)(uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t)),
+             (unsigned)uxTaskPriorityGet(task),
+             (int)xTaskGetCoreID(task));
+}
+
 static void websocket_mic_sink(const uint8_t *pcm, size_t len, void *ctx)
 {
     (void)ctx;
@@ -44,6 +59,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         s_resume_attempted = false;
         ++s_generation;
         ESP_LOGI(TAG, "WebSocket connected, generation=%lu", (unsigned long)s_generation);
+        websocket_task_audit();
         if (!websocket_gemini_on_connected(s_client, s_generation)) {
             ESP_LOGE(TAG, "Gemini setup send failed");
             s_connected = false;
@@ -135,6 +151,7 @@ bool websocket_connect(void)
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+    websocket_task_audit();
     return true;
 }
 
