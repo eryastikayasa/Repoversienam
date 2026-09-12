@@ -3,6 +3,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -19,9 +20,8 @@ static constexpr size_t MIC_READ_BYTES = 1024U;
 static constexpr uint32_t MIC_IDLE_TIMEOUT_MS = 60000U;
 static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
-/* 32 x 20 ms = 640 ms. Large enough to absorb short network stalls without
- * becoming a ~1 s input buffer. */
-static constexpr size_t MIC_TX_QUEUE_DEPTH = 32U;
+/* 16 x 20 ms = 320 ms. Bounded and deliberately below a one-second buffer. */
+static constexpr size_t MIC_TX_QUEUE_DEPTH = 16U;
 
 static audio_engine_mic_frame_cb_t s_mic_listener = nullptr;
 static void *s_mic_listener_ctx = nullptr;
@@ -49,6 +49,30 @@ static bool frame_has_activity(const uint8_t *data, size_t len)
             return true;
     }
     return false;
+}
+
+static void log_mic_task_audit(const char *stage)
+{
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "RAM AUDIT[%s] internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u",
+             stage ? stage : "unknown", (unsigned)internal_free, (unsigned)internal_largest,
+             (unsigned)psram_free, (unsigned)psram_largest);
+    if (s_capture_task) {
+        ESP_LOGI(TAG, "TASK AUDIT audio_capture stack=4096B watermark=%uB priority=%u core=%d",
+                 (unsigned)(uxTaskGetStackHighWaterMark(s_capture_task) * sizeof(StackType_t)),
+                 (unsigned)uxTaskPriorityGet(s_capture_task), (int)xTaskGetCoreID(s_capture_task));
+    }
+    if (s_sink_task) {
+        ESP_LOGI(TAG, "TASK AUDIT mic_tx stack=3072B watermark=%uB priority=%u core=%d",
+                 (unsigned)(uxTaskGetStackHighWaterMark(s_sink_task) * sizeof(StackType_t)),
+                 (unsigned)uxTaskPriorityGet(s_sink_task), (int)xTaskGetCoreID(s_sink_task));
+    }
+    ESP_LOGI(TAG, "MIC RAM MAP frame=%uB queue=%u frames=%uB internal/static",
+             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_TX_QUEUE_DEPTH,
+             (unsigned)(MIC_TX_QUEUE_DEPTH * MIC_FRAME_BYTES));
 }
 
 static void sink_task(void *arg)
@@ -177,6 +201,7 @@ bool audio_engine_start_capture(void)
     }
 
     s_capture_started = true;
+    log_mic_task_audit("capture_start");
     return true;
 }
 
@@ -189,6 +214,7 @@ void audio_engine_start_input_session(void)
     s_last_activity_us = esp_timer_get_time();
     s_input_session_active = true;
     ESP_LOGI(TAG, "MIC session START: AudioEngine -> transport");
+    log_mic_task_audit("session_start");
 }
 
 void audio_engine_stop_input_session(void)
@@ -196,6 +222,7 @@ void audio_engine_stop_input_session(void)
     if (!s_input_session_active) return;
     s_input_session_active = false;
     ESP_LOGI(TAG, "MIC session STOP: AudioEngine");
+    log_mic_task_audit("session_stop");
 }
 
 bool audio_engine_input_session_active(void)
