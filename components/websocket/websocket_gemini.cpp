@@ -5,16 +5,13 @@
 #include "esp_websocket_client.h"
 #include "mbedtls/base64.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "esp_attr.h"
+#include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "WS_GEMINI";
-static constexpr size_t RX_CAP = 32768;
-static EXT_RAM_BSS_ATTR char s_rx[RX_CAP];
-static size_t s_rx_len = 0;
 static volatile bool s_setup_complete = false;
 static volatile bool s_greeting_sent = false;
 static volatile bool s_greeting_finished = false;
@@ -23,94 +20,58 @@ static EXT_RAM_BSS_ATTR char s_resume_handle[4096] = {0};
 static uint64_t s_goaway_ms = 0;
 static esp_websocket_client_handle_t s_client = nullptr;
 
-extern "C" bool websocket_gemini_send_text(esp_websocket_client_handle_t client, const char *text);
-
 static EXT_RAM_BSS_ATTR char s_setup_role[2048] = {0};
 static EXT_RAM_BSS_ATTR char s_setup_escaped[4096] = {0};
 static EXT_RAM_BSS_ATTR char s_setup_json[8192] = {0};
 static EXT_RAM_BSS_ATTR char s_audio_b64[1024];
 static EXT_RAM_BSS_ATTR char s_audio_json[1200];
 
-static bool has(const uint8_t *d, size_t n, const char *needle)
+extern "C" bool websocket_gemini_send_text(esp_websocket_client_handle_t client, const char *text);
+
+/* Repo5-style message classification: complete WebSocket JSON arrives here,
+ * then protocol state and server audio are processed separately. */
+typedef enum {
+    GEMINI_MESSAGE_UNKNOWN = 0,
+    GEMINI_MESSAGE_SETUP,
+    GEMINI_MESSAGE_SERVER_CONTENT,
+    GEMINI_MESSAGE_SESSION_RESUMPTION,
+    GEMINI_MESSAGE_GOAWAY,
+    GEMINI_MESSAGE_ERROR
+} gemini_message_type_t;
+
+static gemini_message_type_t gemini_message_classify(cJSON *root)
 {
-    if (!d || !needle) return false;
-    const size_t m = strlen(needle);
-    if (!m || m > n) return false;
-    for (size_t i = 0; i + m <= n; ++i) if (!memcmp(d + i, needle, m)) return true;
-    return false;
+    if (!cJSON_IsObject(root)) return GEMINI_MESSAGE_UNKNOWN;
+    if (cJSON_GetObjectItemCaseSensitive(root, "error")) return GEMINI_MESSAGE_ERROR;
+    if (cJSON_GetObjectItemCaseSensitive(root, "setupComplete")) return GEMINI_MESSAGE_SETUP;
+    if (cJSON_GetObjectItemCaseSensitive(root, "serverContent")) return GEMINI_MESSAGE_SERVER_CONTENT;
+    if (cJSON_GetObjectItemCaseSensitive(root, "sessionResumptionUpdate")) return GEMINI_MESSAGE_SESSION_RESUMPTION;
+    if (cJSON_GetObjectItemCaseSensitive(root, "goAway")) return GEMINI_MESSAGE_GOAWAY;
+    return GEMINI_MESSAGE_UNKNOWN;
 }
 
-static bool json_string(const uint8_t *d, size_t n, const char *key, char *out, size_t cap)
+static bool json_string(cJSON *object, const char *key, char *out, size_t cap)
 {
-    const size_t k = strlen(key);
-    if (!d || !out || cap < 2) return false;
-    out[0] = 0;
-    for (size_t i = 0; i + k < n; ++i) {
-        if (memcmp(d + i, key, k)) continue;
-        size_t p = i + k;
-        while (p < n && (d[p] == ' ' || d[p] == '\t' || d[p] == '\r' || d[p] == '\n' || d[p] == ':')) ++p;
-        if (p >= n || d[p] != '"') continue;
-        ++p;
-        size_t w = 0; bool esc = false;
-        while (p < n) {
-            const char c = (char)d[p++];
-            if (esc) { if (w + 1 >= cap) return false; out[w++] = c; esc = false; continue; }
-            if (c == '\\') { esc = true; continue; }
-            if (c == '"') { out[w] = 0; return true; }
-            if (w + 1 >= cap) return false;
-            out[w++] = c;
-        }
-    }
-    return false;
+    if (!cJSON_IsObject(object) || !key || !out || cap < 2) return false;
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsString(item) || !item->valuestring) return false;
+    const size_t len = strlen(item->valuestring);
+    if (len + 1U > cap) return false;
+    memcpy(out, item->valuestring, len + 1U);
+    return true;
 }
 
-static void parse_goaway(const uint8_t *d, size_t n)
+static void parse_goaway(cJSON *root)
 {
-    char sec[32] = {0};
-    if (!json_string(d, n, "\"seconds\"", sec, sizeof(sec))) return;
-    const long long s = atoll(sec);
-    if (s < 0) return;
-    s_goaway_ms = (uint64_t)s * 1000ULL;
-    const char key[] = "\"nanos\"";
-    for (size_t i = 0; i + sizeof(key) - 1 < n; ++i) {
-        if (memcmp(d + i, key, sizeof(key) - 1)) continue;
-        size_t p = i + sizeof(key) - 1;
-        while (p < n && (d[p] == ' ' || d[p] == '\t' || d[p] == '\r' || d[p] == '\n' || d[p] == ':')) ++p;
-        long nanos = 0;
-        while (p < n && d[p] >= '0' && d[p] <= '9') {
-            nanos = nanos * 10 + (d[p] - '0');
-            if (nanos > 999999999L) { nanos = 999999999L; break; }
-            ++p;
-        }
-        s_goaway_ms += (uint64_t)nanos / 1000000ULL;
-        break;
-    }
-}
-
-static bool find_audio(const uint8_t *d, size_t n, const char **out, size_t *out_n)
-{
-    static const char ik[] = "\"inlineData\"";
-    static const char dk[] = "\"data\"";
-    *out = nullptr; *out_n = 0;
-    size_t p = n;
-    for (size_t i = 0; i + sizeof(ik) - 1 <= n; ++i) if (!memcmp(d + i, ik, sizeof(ik) - 1)) { p = i + sizeof(ik) - 1; break; }
-    if (p == n) return false;
-    size_t q = n;
-    for (size_t i = p; i + sizeof(dk) - 1 <= n; ++i) {
-        if (!memcmp(d + i, dk, sizeof(dk) - 1)) { q = i + sizeof(dk) - 1; break; }
-        if (d[i] == '}') break;
-    }
-    if (q == n) return false;
-    while (q < n && (d[q] == ' ' || d[q] == '\t' || d[q] == '\r' || d[q] == '\n' || d[q] == ':')) ++q;
-    if (q >= n || d[q] != '"') return false;
-    ++q;
-    const size_t start = q; bool esc = false;
-    for (; q < n; ++q) {
-        if (esc) { esc = false; continue; }
-        if (d[q] == '\\') { esc = true; continue; }
-        if (d[q] == '"') { *out = (const char *)(d + start); *out_n = q - start; return *out_n != 0; }
-    }
-    return false;
+    cJSON *goaway = cJSON_GetObjectItemCaseSensitive(root, "goAway");
+    if (!cJSON_IsObject(goaway)) return;
+    cJSON *seconds = cJSON_GetObjectItemCaseSensitive(goaway, "timeLeft");
+    if (!cJSON_IsObject(seconds)) return;
+    cJSON *sec = cJSON_GetObjectItemCaseSensitive(seconds, "seconds");
+    cJSON *nanos = cJSON_GetObjectItemCaseSensitive(seconds, "nanos");
+    if (cJSON_IsNumber(sec)) s_goaway_ms = (uint64_t)(sec->valuedouble * 1000.0);
+    if (cJSON_IsNumber(nanos) && nanos->valuedouble > 0.0)
+        s_goaway_ms += (uint64_t)(nanos->valuedouble / 1000000.0);
 }
 
 static bool send_greeting_text(void)
@@ -127,74 +88,153 @@ static bool send_greeting_text(void)
     return true;
 }
 
-static void process_json(const uint8_t *d, size_t n, uint32_t gen)
+/* Gemini serverContent -> modelTurn -> parts[] -> inlineData -> base64 PCM16.
+ * This function owns Gemini audio parsing only; AudioEngine remains the audio owner. */
+static bool gemini_audio_process_server_message(cJSON *root, uint32_t generation)
 {
-    if (has(d, n, "\"error\"")) {
-        const size_t log_len = n < 512U ? n : 512U;
-        ESP_LOGE(TAG, "WS_GEMINI: SERVER ERROR");
-        ESP_LOGE(TAG, "WS_GEMINI: SERVER ERROR RAW: %.*s", (int)log_len, d);
+    if (!cJSON_IsObject(root)) return false;
+    cJSON *server = cJSON_GetObjectItemCaseSensitive(root, "serverContent");
+    if (!cJSON_IsObject(server)) return false;
+
+    bool handled = false;
+    cJSON *interrupted = cJSON_GetObjectItemCaseSensitive(server, "interrupted");
+    if (cJSON_IsTrue(interrupted)) {
+        ESP_LOGW(TAG, "Gemini interrupted -> flush playback");
+        audio_engine_notify(AUDIO_ENGINE_EVENT_INTERRUPT, generation);
+        handled = true;
     }
-    if (has(d, n, "\"setupComplete\"")) {
+
+    cJSON *model_turn = cJSON_GetObjectItemCaseSensitive(server, "modelTurn");
+    cJSON *parts = model_turn ? cJSON_GetObjectItemCaseSensitive(model_turn, "parts") : nullptr;
+    if (cJSON_IsArray(parts)) {
+        const int count = cJSON_GetArraySize(parts);
+        for (int i = 0; i < count; ++i) {
+            cJSON *part = cJSON_GetArrayItem(parts, i);
+            if (!cJSON_IsObject(part)) continue;
+            cJSON *inline_data = cJSON_GetObjectItemCaseSensitive(part, "inlineData");
+            if (!cJSON_IsObject(inline_data)) continue;
+
+            cJSON *mime = cJSON_GetObjectItemCaseSensitive(inline_data, "mimeType");
+            cJSON *encoded = cJSON_GetObjectItemCaseSensitive(inline_data, "data");
+            if (!cJSON_IsString(encoded) || !encoded->valuestring || !encoded->valuestring[0]) continue;
+            if (cJSON_IsString(mime) && mime->valuestring &&
+                strncmp(mime->valuestring, "audio/pcm", strlen("audio/pcm")) != 0) {
+                ESP_LOGW(TAG, "Gemini inlineData mimeType bukan PCM: %s", mime->valuestring);
+                continue;
+            }
+
+            const size_t b64_len = strlen(encoded->valuestring);
+            const size_t capacity = (b64_len / 4U) * 3U + 3U;
+            uint8_t *pcm = static_cast<uint8_t *>(malloc(capacity));
+            if (!pcm) {
+                ESP_LOGE(TAG, "Gemini audio decode buffer gagal: %u byte", (unsigned)capacity);
+                continue;
+            }
+
+            size_t decoded_len = 0;
+            const int rc = mbedtls_base64_decode(
+                pcm, capacity, &decoded_len,
+                reinterpret_cast<const unsigned char *>(encoded->valuestring), b64_len);
+            if (rc != 0 || decoded_len == 0 || (decoded_len & 1U) != 0) {
+                ESP_LOGW(TAG, "Gemini audio Base64 gagal: rc=%d b64=%u decoded=%u",
+                         rc, (unsigned)b64_len, (unsigned)decoded_len);
+                free(pcm);
+                continue;
+            }
+
+            ESP_LOGI(TAG, "GEMINI_AUDIO: inlineData PCM16 b64=%u decoded=%u",
+                     (unsigned)b64_len, (unsigned)decoded_len);
+            if (!audio_engine_push_model_audio(pcm, decoded_len, generation)) {
+                ESP_LOGW(TAG, "GEMINI_AUDIO: PCM gagal dikirim ke AudioEngine: %u byte",
+                         (unsigned)decoded_len);
+            } else {
+                ESP_LOGI(TAG, "GEMINI_AUDIO: PCM dikirim ke AudioEngine: %u byte",
+                         (unsigned)decoded_len);
+                audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_AUDIO, generation);
+                handled = true;
+            }
+            free(pcm);
+        }
+    }
+
+    cJSON *turn_complete = cJSON_GetObjectItemCaseSensitive(server, "turnComplete");
+    cJSON *generation_complete = cJSON_GetObjectItemCaseSensitive(server, "generationComplete");
+    if (cJSON_IsTrue(turn_complete) || cJSON_IsTrue(generation_complete)) {
+        audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE, generation);
+        handled = true;
+    }
+    return handled;
+}
+
+static void gemini_protocol_process_message(cJSON *root, const char *json, size_t len, uint32_t generation)
+{
+    const gemini_message_type_t type = gemini_message_classify(root);
+    switch (type) {
+    case GEMINI_MESSAGE_SETUP:
         if (!s_setup_complete) {
             s_setup_complete = true;
             ESP_LOGI(TAG, "WS_GEMINI: Gemini setupComplete");
             if (!send_greeting_text()) ESP_LOGW(TAG, "WS_GEMINI: Greeting JSON gagal dikirim");
         }
+        break;
+
+    case GEMINI_MESSAGE_SERVER_CONTENT:
+        (void)gemini_audio_process_server_message(root, generation);
+        break;
+
+    case GEMINI_MESSAGE_SESSION_RESUMPTION: {
+        cJSON *update = cJSON_GetObjectItemCaseSensitive(root, "sessionResumptionUpdate");
+        cJSON *resumable = cJSON_GetObjectItemCaseSensitive(update, "resumable");
+        if (cJSON_IsTrue(resumable) && json_string(update, "newHandle", s_resume_handle, sizeof(s_resume_handle))) {
+            if (s_resume_handle[0]) {
+                s_resume_available = true;
+                ESP_LOGI(TAG, "Gemini session resumption handle updated");
+            }
+        }
+        break;
     }
-    if (has(d, n, "\"sessionResumptionUpdate\"")) {
-        const bool resumable = has(d, n, "\"resumable\":true");
-        if (resumable && json_string(d, n, "\"newHandle\"", s_resume_handle, sizeof(s_resume_handle)) && s_resume_handle[0]) {
-            s_resume_available = true;
-            ESP_LOGI(TAG, "Gemini session resumption handle updated");
+
+    case GEMINI_MESSAGE_GOAWAY:
+        parse_goaway(root);
+        ESP_LOGW(TAG, "Gemini GoAway timeLeft=%llums", (unsigned long long)s_goaway_ms);
+        break;
+
+    case GEMINI_MESSAGE_ERROR:
+        ESP_LOGE(TAG, "WS_GEMINI: SERVER ERROR");
+        ESP_LOGE(TAG, "WS_GEMINI: SERVER ERROR RAW: %.*s", (int)(len < 512U ? len : 512U), json);
+        audio_engine_notify(AUDIO_ENGINE_EVENT_ERROR, generation);
+        break;
+
+    default:
+        ESP_LOGW(TAG, "WS_RX: Gemini RX belum dipetakan");
+        ESP_LOGW(TAG, "WS_RX: Gemini RX RAW: %.*s", (int)(len < 512U ? len : 512U), json);
+        break;
+    }
+
+    if (s_greeting_sent && !s_greeting_finished) {
+        cJSON *server = cJSON_GetObjectItemCaseSensitive(root, "serverContent");
+        const bool done = cJSON_IsObject(server) &&
+            (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(server, "generationComplete")) ||
+             cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(server, "turnComplete")));
+        if (done) {
+            s_greeting_finished = true;
+            ESP_LOGI(TAG, "WS_GEMINI: Greeting selesai");
+            ESP_LOGI(TAG, "WEBSOCKET: Greeting selesai -> MIC streaming ENABLED");
         }
     }
-    if (has(d, n, "\"goAway\"")) {
-        parse_goaway(d, n);
-        ESP_LOGW(TAG, "Gemini GoAway timeLeft=%llums", (unsigned long long)s_goaway_ms);
-    }
-    const char *b64 = nullptr; size_t b64_n = 0;
-    if (find_audio(d, n, &b64, &b64_n)) {
-        if (audio_engine_push_model_audio_base64(b64, b64_n, gen))
-            audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_AUDIO, gen);
-    }
-    if (has(d, n, "\"interrupted\":true")) {
-        ESP_LOGW(TAG, "Gemini interrupted -> flush playback");
-        audio_engine_notify(AUDIO_ENGINE_EVENT_INTERRUPT, gen);
-    }
-    if (s_greeting_sent && !s_greeting_finished &&
-        (has(d, n, "\"generationComplete\":true") || has(d, n, "\"turnComplete\":true"))) {
-        s_greeting_finished = true;
-        ESP_LOGI(TAG, "WS_GEMINI: Greeting selesai");
-    }
-    if (has(d, n, "\"generationComplete\":true") || has(d, n, "\"turnComplete\":true"))
-        audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE, gen);
 }
 
-static void reset_parser(void) { s_rx_len = 0; }
-
-static void feed_json(const uint8_t *d, size_t n, uint32_t gen)
+static void process_complete_json(const uint8_t *data, size_t len, uint32_t generation)
 {
-    size_t off = 0;
-    while (off < n) {
-        if (s_rx_len >= RX_CAP) reset_parser();
-        const size_t room = RX_CAP - s_rx_len;
-        const size_t take = (n - off < room) ? (n - off) : room;
-        memcpy(s_rx + s_rx_len, d + off, take);
-        s_rx_len += take; off += take;
-        size_t depth = 0, complete = 0; bool str = false, esc = false;
-        for (size_t i = 0; i < s_rx_len; ++i) {
-            const char c = s_rx[i];
-            if (str) { if (esc) esc = false; else if (c == '\\') esc = true; else if (c == '"') str = false; continue; }
-            if (c == '"') { str = true; continue; }
-            if (c == '{') ++depth;
-            else if (c == '}' && depth) { if (--depth == 0) { complete = i + 1; break; } }
-        }
-        if (!complete) continue;
-        process_json((const uint8_t *)s_rx, complete, gen);
-        const size_t left = s_rx_len - complete;
-        if (left) memmove(s_rx, s_rx + complete, left);
-        s_rx_len = left;
+    if (!data || len == 0) return;
+    cJSON *root = cJSON_ParseWithLength(reinterpret_cast<const char *>(data), len);
+    if (!root) {
+        ESP_LOGW(TAG, "WS_RX: Gemini RX JSON invalid len=%u", (unsigned)len);
+        ESP_LOGW(TAG, "WS_RX: Gemini RX RAW: %.*s", (int)(len < 512U ? len : 512U), data);
+        return;
     }
+    gemini_protocol_process_message(root, reinterpret_cast<const char *>(data), len, generation);
+    cJSON_Delete(root);
 }
 
 static bool send_setup(esp_websocket_client_handle_t client)
@@ -249,17 +289,27 @@ static bool send_audio_frame(esp_websocket_client_handle_t client, const uint8_t
 
 extern "C" bool websocket_gemini_on_connected(esp_websocket_client_handle_t client, uint32_t generation)
 {
-    (void)generation; reset_parser(); s_client = client; return send_setup(client);
+    (void)generation;
+    s_client = client;
+    return send_setup(client);
 }
+
 extern "C" void websocket_gemini_on_disconnected(void)
 {
-    reset_parser(); s_setup_complete = false; s_greeting_sent = false; s_greeting_finished = false; s_client = nullptr;
+    s_setup_complete = false;
+    s_greeting_sent = false;
+    s_greeting_finished = false;
+    s_client = nullptr;
     ESP_LOGW(TAG, "Gemini disconnected");
 }
+
 extern "C" void websocket_gemini_on_data(const uint8_t *data, size_t len, int opcode, uint32_t generation)
 {
-    (void)opcode; feed_json(data, len, generation);
+    (void)opcode;
+    /* Called only by the WebSocket RX worker after complete-message assembly. */
+    process_complete_json(data, len, generation);
 }
+
 extern "C" bool websocket_gemini_setup_complete(void) { return s_setup_complete; }
 extern "C" bool websocket_gemini_greeting_finished(void) { return s_greeting_finished; }
 extern "C" bool websocket_gemini_should_resume(void) { return s_resume_available; }
