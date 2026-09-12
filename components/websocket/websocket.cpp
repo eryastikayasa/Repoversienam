@@ -4,6 +4,7 @@
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "web_config.h"
 #include <stdio.h>
@@ -29,6 +30,162 @@ extern "C" bool websocket_gemini_send_audio(esp_websocket_client_handle_t client
 extern "C" bool websocket_gemini_send_audio_stream_end(esp_websocket_client_handle_t client);
 extern "C" bool websocket_gemini_send_text(esp_websocket_client_handle_t client, const char *text);
 
+/* Gemini Live can split one WebSocket message across DATA callbacks.
+ * Reconstruct the complete payload before handing it to the Gemini parser. */
+static constexpr size_t RX_MAX_PAYLOAD = 64U * 1024U;
+static constexpr size_t RX_BUFFER_COUNT = 3U;
+static constexpr size_t RX_DIAGNOSTIC_MAX = 512U;
+static constexpr uint32_t RX_WORKER_STACK = 8192U;
+static constexpr UBaseType_t RX_WORKER_PRIORITY = 5U;
+
+static QueueHandle_t s_rx_free_queue = nullptr;
+static QueueHandle_t s_rx_ready_queue = nullptr;
+static StaticQueue_t s_rx_free_queue_storage;
+static StaticQueue_t s_rx_ready_queue_storage;
+static char *s_rx_free_storage[RX_BUFFER_COUNT];
+static char *s_rx_ready_storage[RX_BUFFER_COUNT];
+static char *s_rx_buffers[RX_BUFFER_COUNT] = {};
+static char *s_rx_assembling_buffer = nullptr;
+static size_t s_rx_expected = 0;
+static size_t s_rx_received = 0;
+static bool s_rx_assembling = false;
+static TaskHandle_t s_rx_worker_task = nullptr;
+static bool s_rx_worker_ready = false;
+
+static bool ensure_rx_worker(void)
+{
+    if (s_rx_worker_ready) return true;
+
+    s_rx_free_queue = xQueueCreateStatic(RX_BUFFER_COUNT, sizeof(char *),
+                                          reinterpret_cast<uint8_t *>(s_rx_free_storage),
+                                          &s_rx_free_queue_storage);
+    s_rx_ready_queue = xQueueCreateStatic(RX_BUFFER_COUNT, sizeof(char *),
+                                           reinterpret_cast<uint8_t *>(s_rx_ready_storage),
+                                           &s_rx_ready_queue_storage);
+    if (!s_rx_free_queue || !s_rx_ready_queue) {
+        ESP_LOGE(TAG, "WS_RX: gagal membuat RX queue");
+        return false;
+    }
+
+    for (size_t i = 0; i < RX_BUFFER_COUNT; ++i) {
+        s_rx_buffers[i] = static_cast<char *>(heap_caps_malloc(
+            RX_MAX_PAYLOAD + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!s_rx_buffers[i]) {
+            ESP_LOGE(TAG, "WS_RX: gagal alokasi PSRAM buffer #%u", (unsigned)i);
+            return false;
+        }
+        if (xQueueSend(s_rx_free_queue, &s_rx_buffers[i], 0) != pdPASS) {
+            ESP_LOGE(TAG, "WS_RX: gagal isi free queue #%u", (unsigned)i);
+            return false;
+        }
+    }
+
+    if (xTaskCreate(
+            [](void *) {
+                ESP_LOGI(TAG, "WS_RX: worker START buffers=%u size=%uKB",
+                         (unsigned)RX_BUFFER_COUNT,
+                         (unsigned)(RX_MAX_PAYLOAD / 1024U));
+                for (;;) {
+                    char *json = nullptr;
+                    if (xQueueReceive(s_rx_ready_queue, &json, portMAX_DELAY) != pdPASS)
+                        continue;
+                    if (!json) continue;
+
+                    const size_t len = strlen(json);
+                    ESP_LOGI(TAG, "WS_RX: RX message complete len=%u", (unsigned)len);
+                    websocket_gemini_on_data(reinterpret_cast<const uint8_t *>(json),
+                                             len, WEBSOCKET_EVENT_DATA, s_generation);
+
+                    if (xQueueSend(s_rx_free_queue, &json, portMAX_DELAY) != pdPASS)
+                        ESP_LOGE(TAG, "WS_RX: gagal mengembalikan RX buffer");
+                }
+            },
+            "ws_rx", RX_WORKER_STACK, nullptr, RX_WORKER_PRIORITY, &s_rx_worker_task) != pdPASS) {
+        ESP_LOGE(TAG, "WS_RX: gagal membuat RX worker");
+        return false;
+    }
+
+    s_rx_worker_ready = true;
+    return true;
+}
+
+static void reset_rx(void)
+{
+    if (s_rx_assembling_buffer) {
+        if (!s_rx_free_queue || xQueueSend(s_rx_free_queue, &s_rx_assembling_buffer, 0) != pdPASS)
+            ESP_LOGW(TAG, "WS_RX: assembly buffer gagal dikembalikan");
+        s_rx_assembling_buffer = nullptr;
+    }
+    s_rx_expected = 0;
+    s_rx_received = 0;
+    s_rx_assembling = false;
+}
+
+static void handle_rx_data(esp_websocket_event_data_t *event)
+{
+    if (!event || !event->data_ptr || event->data_len <= 0 || event->payload_len <= 0) return;
+
+    const size_t payload_len = (size_t)event->payload_len;
+    const size_t payload_offset = (size_t)event->payload_offset;
+    const size_t data_len = (size_t)event->data_len;
+
+    ESP_LOGI(TAG, "WS_RX: DATA payload_len=%u", (unsigned)payload_len);
+    ESP_LOGI(TAG, "WS_RX: payload_offset=%u", (unsigned)payload_offset);
+    ESP_LOGI(TAG, "WS_RX: data_len=%u", (unsigned)data_len);
+
+    if (payload_len > RX_MAX_PAYLOAD ||
+        payload_offset > payload_len ||
+        data_len > payload_len - payload_offset) {
+        ESP_LOGW(TAG, "WS_RX: invalid boundary total=%u offset=%u len=%u",
+                 (unsigned)payload_len, (unsigned)payload_offset, (unsigned)data_len);
+        reset_rx();
+        return;
+    }
+
+    if (!ensure_rx_worker()) {
+        ESP_LOGW(TAG, "WS_RX: RX worker unavailable; payload dropped");
+        reset_rx();
+        return;
+    }
+
+    if (payload_offset == 0U) {
+        reset_rx();
+        if (xQueueReceive(s_rx_free_queue, &s_rx_assembling_buffer, 0) != pdPASS) {
+            ESP_LOGW(TAG, "WS_RX: free queue empty; payload dropped");
+            return;
+        }
+        s_rx_expected = payload_len;
+        s_rx_received = 0;
+        s_rx_assembling = true;
+    } else if (!s_rx_assembling || s_rx_expected != payload_len ||
+               payload_offset != s_rx_received) {
+        ESP_LOGW(TAG,
+                 "WS_RX: fragment sequence invalid offset=%u received=%u expected=%u total=%u",
+                 (unsigned)payload_offset, (unsigned)s_rx_received,
+                 (unsigned)s_rx_expected, (unsigned)payload_len);
+        reset_rx();
+        return;
+    }
+
+    memcpy(s_rx_assembling_buffer + payload_offset, event->data_ptr, data_len);
+    s_rx_received = payload_offset + data_len;
+
+    if (s_rx_received != s_rx_expected) return;
+
+    s_rx_assembling_buffer[s_rx_expected] = '\0';
+    char *ready = s_rx_assembling_buffer;
+    s_rx_assembling_buffer = nullptr;
+    s_rx_expected = 0;
+    s_rx_received = 0;
+    s_rx_assembling = false;
+
+    if (xQueueSend(s_rx_ready_queue, &ready, 0) != pdPASS) {
+        ESP_LOGW(TAG, "WS_RX: ready queue penuh; payload dropped");
+        if (xQueueSend(s_rx_free_queue, &ready, 0) != pdPASS)
+            ESP_LOGE(TAG, "WS_RX: RX buffer hilang");
+    }
+}
+
 static void websocket_task_audit(void)
 {
     TaskHandle_t task = xTaskGetHandle("websocket_task");
@@ -36,12 +193,10 @@ static void websocket_task_audit(void)
         ESP_LOGW(TAG, "TASK AUDIT websocket_task: handle belum tersedia");
         return;
     }
-
     ESP_LOGI(TAG,
              "TASK AUDIT websocket_task stack=4096B watermark=%uB priority=%u core=%d",
              (unsigned)(uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t)),
-             (unsigned)uxTaskPriorityGet(task),
-             (int)xTaskGetCoreID(task));
+             (unsigned)uxTaskPriorityGet(task), (int)xTaskGetCoreID(task));
 }
 
 static void websocket_mic_sink(const uint8_t *pcm, size_t len, void *ctx)
@@ -54,8 +209,10 @@ static void websocket_mic_sink(const uint8_t *pcm, size_t len, void *ctx)
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    (void)handler_args; (void)base;
+    (void)handler_args;
+    (void)base;
     esp_websocket_event_data_t *event = static_cast<esp_websocket_event_data_t *>(event_data);
+
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         s_connected = true;
@@ -64,6 +221,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         ++s_generation;
         ESP_LOGI(TAG, "WebSocket connected, generation=%lu", (unsigned long)s_generation);
         websocket_task_audit();
+        ensure_rx_worker();
         if (!websocket_gemini_on_connected(s_client, s_generation)) {
             ESP_LOGE(TAG, "Gemini setup send failed");
             s_connected = false;
@@ -75,31 +233,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
 
     case WEBSOCKET_EVENT_DATA:
-        if (s_connected && event && event->data_ptr && event->data_len > 0) {
-            websocket_gemini_on_data((const uint8_t *)event->data_ptr,
-                                     (size_t)event->data_len,
-                                     event->op_code, s_generation);
-
-            if (websocket_gemini_setup_complete() && !s_greeting_sent) {
-                static const char greeting_json[] =
-                    "{\"clientContent\":{\"turns\":[{\"role\":\"user\",\"parts\":[{\"text\":\""
-                    "Mulai percakapan dengan mengucapkan tepat: Halo, ada yang bisa dibantu?"
-                    "\"}]}],\"turnComplete\":true}}";
-                if (websocket_send_text(greeting_json)) {
-                    s_greeting_sent = true;
-                    ESP_LOGI(TAG, "WS_GEMINI: Greeting JSON sent");
-                } else {
-                    ESP_LOGW(TAG, "WS_GEMINI: Greeting JSON gagal dikirim");
-                }
-            }
-
-            if (websocket_gemini_setup_complete() &&
-                websocket_gemini_greeting_finished() &&
-                !audio_engine_input_session_active()) {
-                audio_engine_start_input_session();
-                ESP_LOGI(TAG, "WEBSOCKET: Greeting selesai -> MIC streaming ENABLED");
-            }
-        }
+        if (s_connected) handle_rx_data(event);
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
@@ -108,6 +242,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         audio_engine_stop_input_session();
         s_connected = false;
         s_greeting_sent = false;
+        reset_rx();
         websocket_gemini_on_disconnected();
         ESP_LOGW(TAG, "WebSocket disconnected");
         break;
@@ -183,6 +318,7 @@ void websocket_disconnect(void)
         (void)websocket_gemini_send_audio_stream_end(s_client);
     s_connected = false;
     s_greeting_sent = false;
+    reset_rx();
     audio_engine_stop_input_session();
     (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
 }
