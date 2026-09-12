@@ -1,4 +1,5 @@
 #include "websocket.h"
+#include "audio_engine.h"
 
 #include "esp_log.h"
 #include "esp_websocket_client.h"
@@ -28,6 +29,15 @@ extern "C" bool websocket_gemini_send_audio(esp_websocket_client_handle_t client
 extern "C" bool websocket_gemini_send_text(esp_websocket_client_handle_t client,
                                              const char *text);
 
+/* Audio Engine owns capture. WebSocket only provides the transport sink. */
+static void websocket_mic_sink(const uint8_t *pcm, size_t len, void *ctx)
+{
+    (void)ctx;
+    if (!pcm || len == 0) return;
+    if (!websocket_is_connected()) return;
+    (void)websocket_send_audio(pcm, len);
+}
+
 static void websocket_event_handler(void *handler_args,
                                     esp_event_base_t base,
                                     int32_t event_id,
@@ -43,9 +53,13 @@ static void websocket_event_handler(void *handler_args,
     case WEBSOCKET_EVENT_CONNECTED:
         s_connected = true;
         ++s_generation;
-        ESP_LOGI(TAG, "WebSocket TERHUBUNG, generation=%lu",
+        ESP_LOGI(TAG, "WebSocket TERHUBUNG ke Gemini, generation=%lu",
                  (unsigned long)s_generation);
-        (void)websocket_gemini_on_connected(s_client, s_generation);
+        if (!websocket_gemini_on_connected(s_client, s_generation)) {
+            ESP_LOGE(TAG, "Gemini setup gagal setelah WebSocket connected");
+            s_connected = false;
+            (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
+        }
         break;
 
     case WEBSOCKET_EVENT_DATA:
@@ -100,6 +114,12 @@ void websocket_init(void)
 {
     if (s_initialized) return;
 
+    /* Register transport sink once. No I2S or Audio HAL calls live here. */
+    if (!audio_engine_set_mic_sink(websocket_mic_sink, nullptr)) {
+        ESP_LOGE(TAG, "Gagal memasang MIC sink AudioEngine -> WebSocket");
+        return;
+    }
+
     char uri[512] = {0};
     if (!build_server_uri(uri, sizeof(uri))) {
         ESP_LOGE(TAG, "WebSocket init gagal: URI Gemini tidak tersedia");
@@ -129,7 +149,7 @@ void websocket_init(void)
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "WebSocket transport siap");
+    ESP_LOGI(TAG, "WebSocket transport siap | AudioEngine -> WebSocket -> Gemini");
 }
 
 bool websocket_connect(void)
