@@ -21,6 +21,7 @@ extern "C" bool websocket_gemini_on_connected(esp_websocket_client_handle_t clie
 extern "C" void websocket_gemini_on_disconnected(void);
 extern "C" void websocket_gemini_on_data(const uint8_t *data, size_t len, int opcode, uint32_t generation);
 extern "C" bool websocket_gemini_setup_complete(void);
+extern "C" bool websocket_gemini_greeting_finished(void);
 extern "C" bool websocket_gemini_should_resume(void);
 extern "C" uint64_t websocket_gemini_goaway_time_left_ms(void);
 extern "C" bool websocket_gemini_send_audio(esp_websocket_client_handle_t client, const uint8_t *data, size_t len);
@@ -45,7 +46,8 @@ static void websocket_task_audit(void)
 static void websocket_mic_sink(const uint8_t *pcm, size_t len, void *ctx)
 {
     (void)ctx;
-    if (!pcm || len != 640U || !websocket_is_connected() || !websocket_setup_complete()) return;
+    if (!pcm || len != 640U || !websocket_is_connected() ||
+        !websocket_setup_complete() || !websocket_gemini_greeting_finished()) return;
     (void)websocket_send_audio(pcm, len);
 }
 
@@ -67,7 +69,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             break;
         }
         audio_engine_notify(AUDIO_ENGINE_EVENT_GENERATION_CHANGED, s_generation);
-        ESP_LOGI(TAG, "Waiting for Gemini setupComplete before MIC streaming");
+        ESP_LOGI(TAG, "Waiting for Gemini setupComplete before greeting");
         break;
 
     case WEBSOCKET_EVENT_DATA:
@@ -75,9 +77,11 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             websocket_gemini_on_data((const uint8_t *)event->data_ptr,
                                      (size_t)event->data_len,
                                      event->op_code, s_generation);
-            if (websocket_gemini_setup_complete() && !audio_engine_input_session_active()) {
+            if (websocket_gemini_setup_complete() &&
+                websocket_gemini_greeting_finished() &&
+                !audio_engine_input_session_active()) {
                 audio_engine_start_input_session();
-                ESP_LOGI(TAG, "Gemini setupComplete -> MIC streaming ENABLED");
+                ESP_LOGI(TAG, "WEBSOCKET: Greeting selesai -> MIC streaming ENABLED");
             }
         }
         break;
@@ -169,7 +173,8 @@ bool websocket_is_connected(void) { return s_connected && s_client != nullptr; }
 
 bool websocket_send_audio(const uint8_t *data, size_t length)
 {
-    if (!data || length != 640U || !websocket_is_connected() || !websocket_setup_complete()) return false;
+    if (!data || length != 640U || !websocket_is_connected() || !websocket_setup_complete() ||
+        !websocket_gemini_greeting_finished()) return false;
     return websocket_gemini_send_audio(s_client, data, length);
 }
 
