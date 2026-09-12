@@ -1,9 +1,15 @@
 idf_component_register(
     SRCS
         "websocket.cpp"
-        "websocket_gemini.cpp"
+        "websocket_transport.cpp"
+        "websocket_event.cpp"
+        "websocket_audio.cpp"
+        "gemini/gemini_protocol.cpp"
+        "gemini/gemini_message.cpp"
+        "gemini/gemini_audio.cpp"
     INCLUDE_DIRS
         "include"
+        "gemini"
     REQUIRES
         esp_websocket_client
         esp-tls
