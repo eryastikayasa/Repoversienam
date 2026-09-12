@@ -5,18 +5,24 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "display_face.h"
 #include "display_text.h"
 #include "display_driver.h"
 
 namespace {
 
-constexpr int DISPLAY_ENGINE_FRAME_MS = 33;
+constexpr int DISPLAY_ENGINE_FRAME_MS = 100;
 constexpr int DISPLAY_ENGINE_WIDTH = DISPLAY_DRIVER_WIDTH;
 constexpr int DISPLAY_ENGINE_HEIGHT = DISPLAY_DRIVER_HEIGHT;
 constexpr size_t DISPLAY_FRAMEBUFFER_SIZE =
     (size_t)DISPLAY_ENGINE_WIDTH * (size_t)DISPLAY_ENGINE_HEIGHT / 8U;
+constexpr uint32_t DISPLAY_ENGINE_STACK = 4096U;
+constexpr UBaseType_t DISPLAY_ENGINE_PRIORITY = 3U;
+constexpr BaseType_t DISPLAY_ENGINE_CORE = 1;
 
+static const char *TAG = "DISPLAY_ENGINE";
 static EXT_RAM_BSS_ATTR uint8_t s_final_buffer[DISPLAY_FRAMEBUFFER_SIZE] = {0};
 static TaskHandle_t s_display_engine_task = nullptr;
 static bool s_initialized = false;
@@ -70,9 +76,45 @@ static void compose_frame(void)
     }
 }
 
+static void log_display_audit(const char *stage)
+{
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (s_display_engine_task) {
+        ESP_LOGI(TAG,
+                 "TASK AUDIT display_engine stack=%uB watermark=%uB priority=%u core=%d",
+                 (unsigned)DISPLAY_ENGINE_STACK,
+                 (unsigned)(uxTaskGetStackHighWaterMark(s_display_engine_task) * sizeof(StackType_t)),
+                 (unsigned)uxTaskPriorityGet(s_display_engine_task),
+                 (int)xTaskGetCoreID(s_display_engine_task));
+    }
+
+    ESP_LOGI(TAG,
+             "RAM AUDIT[%s] internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u framebuffer=%uB PSRAM",
+             stage ? stage : "unknown",
+             (unsigned)internal_free,
+             (unsigned)internal_largest,
+             (unsigned)psram_free,
+             (unsigned)psram_largest,
+             (unsigned)DISPLAY_FRAMEBUFFER_SIZE);
+}
+
 static void display_engine_task(void *)
 {
     TickType_t last_wake = xTaskGetTickCount();
+    int64_t last_audit_us = 0;
+
+    ESP_LOGI(TAG,
+             "Display task: %dx%d framebuffer=%uB PSRAM frame=%ums priority=%u core=%d",
+             DISPLAY_ENGINE_WIDTH,
+             DISPLAY_ENGINE_HEIGHT,
+             (unsigned)DISPLAY_FRAMEBUFFER_SIZE,
+             (unsigned)DISPLAY_ENGINE_FRAME_MS,
+             (unsigned)DISPLAY_ENGINE_PRIORITY,
+             (int)DISPLAY_ENGINE_CORE);
 
     while (s_running) {
         const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
@@ -88,6 +130,13 @@ static void display_engine_task(void *)
             DISPLAY_ENGINE_HEIGHT
         );
 
+        const int64_t now_us = esp_timer_get_time();
+        if (!last_audit_us || now_us - last_audit_us >= 10000000LL) {
+            last_audit_us = now_us;
+            log_display_audit("runtime");
+        }
+
+        /* Keep a scheduler boundary even if the display driver returns quickly. */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DISPLAY_ENGINE_FRAME_MS));
     }
 
@@ -116,18 +165,20 @@ void display_engine_start(void)
 
     s_running = true;
 
-    BaseType_t result = xTaskCreate(
+    BaseType_t result = xTaskCreatePinnedToCore(
         display_engine_task,
         "display_engine",
-        4096,
+        DISPLAY_ENGINE_STACK,
         nullptr,
-        5,
-        &s_display_engine_task
+        DISPLAY_ENGINE_PRIORITY,
+        &s_display_engine_task,
+        DISPLAY_ENGINE_CORE
     );
 
     if (result != pdPASS) {
         s_running = false;
         s_display_engine_task = nullptr;
+        ESP_LOGE(TAG, "Display task create gagal");
     }
 }
 
