@@ -29,7 +29,6 @@ extern "C" void app_startup_run(void)
 {
     ESP_LOGI(TAG, "Repo6 startup: app_startup_run()");
 
-    /* 1. NVS is the persistent source for WiFi/API key/Role. */
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_LOGW(TAG, "NVS perlu erase/init ulang");
@@ -40,7 +39,6 @@ extern "C" void app_startup_run(void)
         return;
     }
 
-    /* 2. Web Config runs only when required; values are saved to NVS. */
     display_engine_init();
     display_engine_start();
     uart_control_init();
@@ -51,7 +49,6 @@ extern "C" void app_startup_run(void)
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    /* 3. Hardware + Audio Engine. Wake word listens through Audio Engine. */
     audio_hal_init();
     audio_hal_ns_init();
     if (!audio_engine_init()) {
@@ -59,7 +56,6 @@ extern "C" void app_startup_run(void)
         return;
     }
 
-    /* 4. WiFi must be ready before the assistant can contact Gemini. */
     wifi_init_sta();
     if (!wifi_wait_for_connection(30000)) {
         ESP_LOGE(TAG, "Wi-Fi belum READY -> startup dihentikan");
@@ -67,7 +63,6 @@ extern "C" void app_startup_run(void)
     }
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    /* 5. Wake Word is the gate into an assistant/Gemini session. */
     if (!wakeword_init()) {
         ESP_LOGE(TAG, "WakeNet init gagal -> startup dihentikan");
         return;
@@ -82,16 +77,14 @@ extern "C" void app_startup_run(void)
         return;
     }
 
-    ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi/API Key/Role -> Wake Word");
+    ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi -> Wake Word");
     ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
     ESP_LOGI(TAG, "Menunggu Wake Word sebelum membuka sesi Gemini...");
 
-    /* 6. Wake Word opens a transport session. WebSocket remains transport-only. */
     for (;;) {
-        if (s_assistant_requested) {
+        if (s_assistant_requested && !websocket_is_connected()) {
             s_assistant_requested = false;
-            ESP_LOGI(TAG, "Wake Word diterima -> mulai sesi Gemini");
-
+            ESP_LOGI(TAG, "Wake Word diterima -> buka sesi Gemini");
             websocket_init();
             if (!websocket_connect()) {
                 ESP_LOGE(TAG, "WebSocket Gemini gagal start");
@@ -99,8 +92,19 @@ extern "C" void app_startup_run(void)
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
+            ESP_LOGI(TAG, "WebSocket connected; menunggu setupComplete sebelum MIC streaming");
+        }
 
-            ESP_LOGI(TAG, "Menunggu WebSocket CONNECTED...");
+        if (!websocket_is_connected() && websocket_should_resume()) {
+            ESP_LOGW(TAG, "Gemini GoAway -> reconnect menggunakan session resumption");
+            if (websocket_connect()) {
+                s_session_was_connected = true;
+                ESP_LOGI(TAG, "Gemini session resumed; waiting for setupComplete");
+            } else {
+                ESP_LOGW(TAG, "Gemini session resume gagal -> kembali ke Wake Word");
+                (void)wakeword_rearm();
+                s_session_was_connected = false;
+            }
         }
 
         const bool connected = websocket_is_connected();
@@ -111,11 +115,10 @@ extern "C" void app_startup_run(void)
                 ESP_LOGI(TAG, "MIC -> Audio HAL -> Audio Engine -> WebSocket -> Gemini");
                 ESP_LOGI(TAG, "Gemini -> WebSocket -> Audio Engine -> Audio HAL -> SPEAKER");
             }
-        } else if (s_session_was_connected) {
-            /* A completed/failed transport session returns control to Wake Word. */
+        } else if (s_session_was_connected && !websocket_should_resume()) {
             s_session_was_connected = false;
             s_assistant_requested = false;
-            ESP_LOGI(TAG, "Sesi Gemini berakhir -> kembali menunggu Wake Word");
+            ESP_LOGI(TAG, "Sesi Gemini selesai -> kembali menunggu Wake Word");
             (void)wakeword_rearm();
         }
 
