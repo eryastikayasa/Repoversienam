@@ -8,6 +8,7 @@ idf_component_register(
         web_config
         wifi_manager
         websocket
+        wakeword
         nvs_flash
         esp_netif
         esp_event
