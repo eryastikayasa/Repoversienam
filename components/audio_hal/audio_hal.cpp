@@ -112,7 +112,7 @@ static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, 
     float best_score = 0.0f; size_t best_lag = 0; constexpr size_t MAX_LAG_SAMPLES = 320; constexpr size_t LAG_STEP_SAMPLES = 16;
     for (size_t lag = 0; lag <= MAX_LAG_SAMPLES; lag += LAG_STEP_SAMPLES) { const size_t n = samples - lag; double dot = 0.0, mic_energy = 0.0, ref_energy = 0.0; for (size_t i = 0; i < n; ++i) { const double m = (double)mic[i + lag]; const double r = (double)ref[i]; dot += m * r; mic_energy += m * m; ref_energy += r * r; } if (mic_energy <= 0.0 || ref_energy <= 0.0) continue; const float score = (float)(fabs(dot) / sqrt(mic_energy * ref_energy)); if (score > best_score) { best_score = score; best_lag = lag; } }
     size_t current_delay; portENTER_CRITICAL(&aec_ref_mux); current_delay = aec_ref_delay_samples; portEXIT_CRITICAL(&aec_ref_mux); const size_t suggested = current_delay + best_lag; const size_t target = suggested > AEC_REF_MAX_DELAY_SAMPLES ? AEC_REF_MAX_DELAY_SAMPLES : suggested; const bool reliable = best_score >= 0.55f && best_lag <= (AEC_REF_MAX_DELAY_SAMPLES / 2);
-    if (reliable && target != current_delay) { if (candidate_delay > target + 16 || target > candidate_delay + 16) { candidate_delay = target; stable_hits = 1; } else { ++stable_hits; } if (stable_hits >= 3) { portENTER_CRITICAL(&aec_ref_mux); aec_ref_delay_samples = candidate_delay; aec_ref_last_target_end = aec_ref_write > candidate_delay ? aec_ref_write - candidate_delay : 0; portEXIT_CRITICAL(&aec_ref_mux); stable_hits = 0; } } else stable_hits = 0;
+    if (reliable && target != current_delay) { static size_t candidate_delay = AEC_REF_INITIAL_DELAY_SAMPLES; static unsigned stable_hits = 0; if (candidate_delay > target + 16 || target > candidate_delay + 16) { candidate_delay = target; stable_hits = 1; } else { ++stable_hits; } if (stable_hits >= 3) { portENTER_CRITICAL(&aec_ref_mux); aec_ref_delay_samples = candidate_delay; aec_ref_last_target_end = aec_ref_write > candidate_delay ? aec_ref_write - candidate_delay : 0; portEXIT_CRITICAL(&aec_ref_mux); stable_hits = 0; } }
     size_t applied_delay; portENTER_CRITICAL(&aec_ref_mux); applied_delay = aec_ref_delay_samples; portEXIT_CRITICAL(&aec_ref_mux); ESP_LOGI(TAG, "AEC ALIGN: best_lag=%ums corr=%u/1000 ref_delay=%ums suggested=%ums applied=%ums", (unsigned)(best_lag * 1000 / MIC_SAMPLE_RATE), (unsigned)(best_score * 1000.0f), (unsigned)(current_delay * 1000 / MIC_SAMPLE_RATE), (unsigned)(target * 1000 / MIC_SAMPLE_RATE), (unsigned)(applied_delay * 1000 / MIC_SAMPLE_RATE));
 }
 void audio_hal_init(void)
@@ -139,8 +139,28 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
 }
 size_t audio_write_speaker(const uint8_t *src, size_t len)
 {
-    if (!tx_handle || !src || len < 2) return 0; len &= ~((size_t)1); static int32_t tx_buffer[1024]; static int16_t ref_pcm[240]; const int16_t *pcm = reinterpret_cast<const int16_t *>(src); const size_t total = len / sizeof(int16_t); size_t offset = 0; constexpr size_t I2S_WRITE_SAMPLES = 240; constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
-    while (offset < total) { const size_t old_offset = offset; size_t n = total - offset; if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES; for (size_t i = 0; i < n; ++i) tx_buffer[i] = static_cast<int32_t>(pcm[old_offset + i]) << 16; size_t written = 0; esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS); size_t samples_written = written / sizeof(int32_t); if (samples_written > n) samples_written = n; if (samples_written > 0) { offset += samples_written; memcpy(ref_pcm, pcm + old_offset, samples_written * sizeof(int16_t)); aec_ref_push_24k(ref_pcm, samples_written); } if (err != ESP_OK || samples_written != n) { if (err != ESP_OK || samples_written == 0) { ESP_LOGW(TAG, "I2S speaker write fail: err=%s written=%u/%u", esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t))); vTaskDelay(1); return offset * sizeof(int16_t); } continue; } }
+    if (!tx_handle || !src || len < 2) return 0; len &= ~((size_t)1); static int32_t tx_buffer[1024]; static int16_t ref_pcm[240]; const int16_t *pcm = reinterpret_cast<const int16_t *>(src); const size_t total = len / sizeof(int16_t); size_t offset = 0; constexpr size_t I2S_WRITE_SAMPLES = 240; constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 20;
+    while (offset < total) {
+        const size_t old_offset = offset; size_t n = total - offset; if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES;
+        for (size_t i = 0; i < n; ++i) tx_buffer[i] = static_cast<int32_t>(pcm[old_offset + i]) << 16;
+        size_t written = 0; esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
+        size_t samples_written = written / sizeof(int32_t); if (samples_written > n) samples_written = n;
+        if (samples_written > 0) { offset += samples_written; memcpy(ref_pcm, pcm + old_offset, samples_written * sizeof(int16_t)); aec_ref_push_24k(ref_pcm, samples_written); }
+        if (err != ESP_OK || samples_written != n) {
+            if (err != ESP_OK || samples_written == 0) {
+                ESP_LOGW(TAG, "I2S speaker write fail: err=%s written=%u/%u", esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)));
+                vTaskDelay(1);
+                return offset * sizeof(int16_t);
+            }
+            /* Partial DMA progress with ESP_OK must not become a tight retry
+             * loop. Yield before retrying the remaining samples. */
+            vTaskDelay(1);
+            continue;
+        }
+        /* One DMA block is about 10 ms at 24 kHz. Yield even when the driver
+         * accepts the block immediately so IDLE/WiFi can run on CPU0. */
+        vTaskDelay(1);
+    }
     return offset * sizeof(int16_t);
 }
 void audio_i2s_test_tone(void)
