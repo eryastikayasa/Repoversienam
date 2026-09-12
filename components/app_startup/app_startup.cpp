@@ -48,11 +48,13 @@ extern "C" void app_startup_run(void)
 
     audio_hal_init();
     audio_hal_ns_init();
+    audio_engine_log_diagnostics("boot_audio_ready");
     if (!audio_engine_init()) return;
 
     wifi_init_sta();
     if (!wifi_wait_for_connection(30000)) return;
     esp_wifi_set_ps(WIFI_PS_NONE);
+    audio_engine_log_diagnostics("wifi_ready");
 
     if (!wakeword_init()) return;
     if (!wakeword_start(on_wakeword_detected, nullptr)) return;
@@ -60,6 +62,7 @@ extern "C" void app_startup_run(void)
 
     ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi -> Wake Word");
     ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
+    audio_engine_log_diagnostics("wakeword_ready");
 
     for (;;) {
         if (s_assistant_requested && !websocket_is_connected()) {
@@ -91,11 +94,13 @@ extern "C" void app_startup_run(void)
             ESP_LOGI(TAG, "PIPELINE READY:");
             ESP_LOGI(TAG, "MIC -> Audio HAL -> Audio Engine -> WebSocket -> Gemini");
             ESP_LOGI(TAG, "Gemini -> WebSocket -> Audio Engine -> Audio HAL -> SPEAKER");
+            audio_engine_log_diagnostics("gemini_connected");
         } else if (!connected && s_session_was_connected) {
             s_session_was_connected = false;
             s_assistant_requested = false;
             ESP_LOGI(TAG, "Sesi Gemini selesai -> kembali menunggu Wake Word");
             (void)wakeword_rearm();
+            audio_engine_log_diagnostics("gemini_disconnected");
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
