@@ -38,8 +38,7 @@ static bool json_string(const uint8_t *d, size_t n, const char *key, char *out, 
         while (p < n && (d[p] == ' ' || d[p] == '\t' || d[p] == '\r' || d[p] == '\n' || d[p] == ':')) ++p;
         if (p >= n || d[p] != '"') continue;
         ++p;
-        size_t w = 0;
-        bool esc = false;
+        size_t w = 0; bool esc = false;
         while (p < n) {
             const char c = (char)d[p++];
             if (esc) { if (w + 1 >= cap) return false; out[w++] = c; esc = false; continue; }
@@ -92,8 +91,7 @@ static bool find_audio(const uint8_t *d, size_t n, const char **out, size_t *out
     while (q < n && (d[q] == ' ' || d[q] == '\t' || d[q] == '\r' || d[q] == '\n' || d[q] == ':')) ++q;
     if (q >= n || d[q] != '"') return false;
     ++q;
-    const size_t start = q;
-    bool esc = false;
+    const size_t start = q; bool esc = false;
     for (; q < n; ++q) {
         if (esc) { esc = false; continue; }
         if (d[q] == '\\') { esc = true; continue; }
@@ -121,7 +119,6 @@ static void process_json(const uint8_t *d, size_t n, uint32_t gen)
         parse_goaway(d, n);
         ESP_LOGW(TAG, "Gemini GoAway timeLeft=%llums", (unsigned long long)s_goaway_ms);
     }
-
     const char *b64 = nullptr; size_t b64_n = 0;
     if (find_audio(d, n, &b64, &b64_n)) {
         if (audio_engine_push_model_audio_base64(b64, b64_n, gen))
@@ -146,7 +143,6 @@ static void feed_json(const uint8_t *d, size_t n, uint32_t gen)
         const size_t take = (n - off < room) ? (n - off) : room;
         memcpy(s_rx + s_rx_len, d + off, take);
         s_rx_len += take; off += take;
-
         size_t depth = 0, complete = 0; bool str = false, esc = false;
         for (size_t i = 0; i < s_rx_len; ++i) {
             const char c = s_rx[i];
@@ -177,12 +173,11 @@ static bool send_setup(esp_websocket_client_handle_t client)
         }
         escaped[w] = 0;
     }
-
     char json[8192] = {0};
     const char *resume = s_resume_available ? ",\"sessionResumption\":{\"handle\":\"" : "";
     const char *resume_end = s_resume_available ? "\"}" : "";
     const char *role_part = have_role ? ",\"systemInstruction\":{\"parts\":[{\"text\":\"" : "";
-    const char *role_end = have_role ? "\"}]" : "";
+    const char *role_end = have_role ? "\"}]}" : "";
     const int n = snprintf(json, sizeof(json),
         "{\"setup\":{\"model\":\"models/gemini-3.1-flash-live-preview\","
         "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
@@ -203,8 +198,7 @@ static bool send_setup(esp_websocket_client_handle_t client)
 static bool send_audio_frame(esp_websocket_client_handle_t client, const uint8_t *data, size_t len)
 {
     if (!client || !data || !len || len > 640) return false;
-    static char b64[1024]; static char json[1200];
-    size_t b64_len = 0;
+    static char b64[1024]; static char json[1200]; size_t b64_len = 0;
     if (mbedtls_base64_encode((unsigned char *)b64, sizeof(b64) - 1, &b64_len, data, len) != 0) return false;
     b64[b64_len] = 0;
     const int n = snprintf(json, sizeof(json), "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}", b64);
@@ -217,7 +211,6 @@ extern "C" void websocket_gemini_on_disconnected(void) { reset_parser(); s_setup
 extern "C" void websocket_gemini_on_data(const uint8_t *data, size_t len, int opcode, uint32_t generation) { (void)opcode; feed_json(data, len, generation); }
 extern "C" bool websocket_gemini_setup_complete(void) { return s_setup_complete; }
 extern "C" bool websocket_gemini_should_resume(void) { return s_resume_available; }
-extern "C" void websocket_gemini_clear_resume_request(void) { s_resume_available = false; }
 extern "C" uint64_t websocket_gemini_goaway_time_left_ms(void) { return s_goaway_ms; }
 extern "C" bool websocket_gemini_send_audio(esp_websocket_client_handle_t client, const uint8_t *data, size_t len) { return send_audio_frame(client, data, len); }
 extern "C" bool websocket_gemini_send_audio_stream_end(esp_websocket_client_handle_t client) { static const char msg[] = "{\"realtimeInput\":{\"audioStreamEnd\":true}}"; return client && esp_websocket_client_send_text(client, msg, sizeof(msg)-1, pdMS_TO_TICKS(500)) == (int)(sizeof(msg)-1); }
