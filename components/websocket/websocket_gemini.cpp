@@ -23,6 +23,8 @@ static EXT_RAM_BSS_ATTR char s_resume_handle[4096] = {0};
 static uint64_t s_goaway_ms = 0;
 static esp_websocket_client_handle_t s_client = nullptr;
 
+static bool websocket_gemini_send_text(esp_websocket_client_handle_t client, const char *text);
+
 /* Large setup/send scratch buffers are persistent because the WebSocket
  * transport is serialized through its event task. They are data buffers, not
  * DMA/ISR buffers, so PSRAM is the appropriate capability domain. */
