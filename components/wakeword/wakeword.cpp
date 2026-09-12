@@ -1,5 +1,6 @@
 #include "wakeword.h"
 #include "audio_engine.h"
+#include "audio_hal.h"
 
 #include "esp_log.h"
 #include "esp_wn_iface.h"
