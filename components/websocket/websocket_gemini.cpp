@@ -5,18 +5,29 @@
 #include "esp_websocket_client.h"
 #include "mbedtls/base64.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_attr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "WS_GEMINI";
 static constexpr size_t RX_CAP = 32768;
-static char s_rx[RX_CAP];
+static EXT_RAM_BSS_ATTR char s_rx[RX_CAP];
 static size_t s_rx_len = 0;
 static volatile bool s_setup_complete = false;
 static volatile bool s_resume_available = false;
-static char s_resume_handle[4096] = {0};
+static EXT_RAM_BSS_ATTR char s_resume_handle[4096] = {0};
 static uint64_t s_goaway_ms = 0;
+
+/* Large setup/send scratch buffers are persistent because the WebSocket
+ * transport is serialized through its event task. They are data buffers, not
+ * DMA/ISR buffers, so PSRAM is the appropriate capability domain. */
+static EXT_RAM_BSS_ATTR char s_setup_role[2048] = {0};
+static EXT_RAM_BSS_ATTR char s_setup_escaped[4096] = {0};
+static EXT_RAM_BSS_ATTR char s_setup_json[8192] = {0};
+static EXT_RAM_BSS_ATTR char s_audio_b64[1024];
+static EXT_RAM_BSS_ATTR char s_audio_json[1200];
 
 static bool has(const uint8_t *d, size_t n, const char *needle)
 {
@@ -108,9 +119,7 @@ static void process_json(const uint8_t *d, size_t n, uint32_t gen)
     }
     if (has(d, n, "\"sessionResumptionUpdate\"")) {
         const bool resumable = has(d, n, "\"resumable\":true");
-        char h[sizeof(s_resume_handle)] = {0};
-        if (resumable && json_string(d, n, "\"newHandle\"", h, sizeof(h)) && h[0]) {
-            strncpy(s_resume_handle, h, sizeof(s_resume_handle) - 1U);
+        if (resumable && json_string(d, n, "\"newHandle\"", s_resume_handle, sizeof(s_resume_handle)) && s_resume_handle[0]) {
             s_resume_available = true;
             ESP_LOGI(TAG, "Gemini session resumption handle updated");
         }
@@ -161,33 +170,33 @@ static void feed_json(const uint8_t *d, size_t n, uint32_t gen)
 
 static bool send_setup(esp_websocket_client_handle_t client)
 {
-    char role[2048] = {0};
-    const bool have_role = web_config_load_role(role, sizeof(role)) && role[0];
-    char escaped[4096] = {0};
+    s_setup_role[0] = 0;
+    const bool have_role = web_config_load_role(s_setup_role, sizeof(s_setup_role)) && s_setup_role[0];
+    s_setup_escaped[0] = 0;
     if (have_role) {
         size_t w = 0;
-        for (size_t i = 0; role[i] && w + 2 < sizeof(escaped); ++i) {
-            const unsigned char c = (unsigned char)role[i];
-            if (c == '"' || c == '\\') escaped[w++] = '\\';
-            escaped[w++] = (c < 0x20U) ? ' ' : (char)c;
+        for (size_t i = 0; s_setup_role[i] && w + 2 < sizeof(s_setup_escaped); ++i) {
+            const unsigned char c = (unsigned char)s_setup_role[i];
+            if (c == '"' || c == '\\') s_setup_escaped[w++] = '\\';
+            s_setup_escaped[w++] = (c < 0x20U) ? ' ' : (char)c;
         }
-        escaped[w] = 0;
+        s_setup_escaped[w] = 0;
     }
-    char json[8192] = {0};
+    s_setup_json[0] = 0;
     const char *resume = s_resume_available ? ",\"sessionResumption\":{\"handle\":\"" : ",\"sessionResumption\":{}";
     const char *resume_end = s_resume_available ? "\"}" : "";
     const char *role_part = have_role ? ",\"systemInstruction\":{\"parts\":[{\"text\":\"" : "";
     const char *role_end = have_role ? "\"}]}" : "";
-    const int n = snprintf(json, sizeof(json),
+    const int n = snprintf(s_setup_json, sizeof(s_setup_json),
         "{\"setup\":{\"model\":\"models/gemini-3.1-flash-live-preview\","
         "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
         "\"speechConfig\":{\"languageCode\":\"id-ID\",\"voiceConfig\":{\"prebuiltVoiceConfig\":{\"voiceName\":\"Kore\"}}}},"
         "\"contextWindowCompression\":{\"slidingWindow\":{}},"
         "\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":false,\"startOfSpeechSensitivity\":\"START_SENSITIVITY_HIGH\",\"prefixPaddingMs\":40,\"endOfSpeechSensitivity\":\"END_SENSITIVITY_HIGH\",\"silenceDurationMs\":500}}%s%s%s%s%s%s}}}",
-        role_part, have_role ? escaped : "", role_end,
+        role_part, have_role ? s_setup_escaped : "", role_end,
         resume, s_resume_available ? s_resume_handle : "", resume_end);
-    if (n <= 0 || (size_t)n >= sizeof(json)) return false;
-    const int sent = esp_websocket_client_send_text(client, json, n, pdMS_TO_TICKS(2000));
+    if (n <= 0 || (size_t)n >= sizeof(s_setup_json)) return false;
+    const int sent = esp_websocket_client_send_text(client, s_setup_json, n, pdMS_TO_TICKS(2000));
     if (sent != n) return false;
     s_setup_complete = false;
     s_goaway_ms = 0;
@@ -198,12 +207,12 @@ static bool send_setup(esp_websocket_client_handle_t client)
 static bool send_audio_frame(esp_websocket_client_handle_t client, const uint8_t *data, size_t len)
 {
     if (!client || !data || !len || len > 640) return false;
-    static char b64[1024]; static char json[1200]; size_t b64_len = 0;
-    if (mbedtls_base64_encode((unsigned char *)b64, sizeof(b64) - 1, &b64_len, data, len) != 0) return false;
-    b64[b64_len] = 0;
-    const int n = snprintf(json, sizeof(json), "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}", b64);
-    if (n <= 0 || (size_t)n >= sizeof(json)) return false;
-    return esp_websocket_client_send_text(client, json, n, pdMS_TO_TICKS(100)) == n;
+    size_t b64_len = 0;
+    if (mbedtls_base64_encode((unsigned char *)s_audio_b64, sizeof(s_audio_b64) - 1, &b64_len, data, len) != 0) return false;
+    s_audio_b64[b64_len] = 0;
+    const int n = snprintf(s_audio_json, sizeof(s_audio_json), "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}", s_audio_b64);
+    if (n <= 0 || (size_t)n >= sizeof(s_audio_json)) return false;
+    return esp_websocket_client_send_text(client, s_audio_json, n, pdMS_TO_TICKS(100)) == n;
 }
 
 extern "C" bool websocket_gemini_on_connected(esp_websocket_client_handle_t client, uint32_t generation) { (void)generation; reset_parser(); return send_setup(client); }
