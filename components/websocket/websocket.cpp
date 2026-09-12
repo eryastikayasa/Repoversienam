@@ -14,6 +14,7 @@ static esp_websocket_client_handle_t s_client = nullptr;
 static volatile bool s_connected = false;
 static volatile bool s_initialized = false;
 static volatile bool s_resume_attempted = false;
+static volatile bool s_greeting_sent = false;
 static uint32_t s_generation = 0;
 static constexpr TickType_t CONNECT_WAIT_TICKS = pdMS_TO_TICKS(15000);
 
@@ -59,6 +60,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     case WEBSOCKET_EVENT_CONNECTED:
         s_connected = true;
         s_resume_attempted = false;
+        s_greeting_sent = false;
         ++s_generation;
         ESP_LOGI(TAG, "WebSocket connected, generation=%lu", (unsigned long)s_generation);
         websocket_task_audit();
@@ -77,6 +79,20 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             websocket_gemini_on_data((const uint8_t *)event->data_ptr,
                                      (size_t)event->data_len,
                                      event->op_code, s_generation);
+
+            if (websocket_gemini_setup_complete() && !s_greeting_sent) {
+                static const char greeting_json[] =
+                    "{\"clientContent\":{\"turns\":[{\"role\":\"user\",\"parts\":[{\"text\":\""
+                    "Mulai percakapan dengan mengucapkan tepat: Halo, ada yang bisa dibantu?"
+                    "\"}]}],\"turnComplete\":true}}";
+                if (websocket_send_text(greeting_json)) {
+                    s_greeting_sent = true;
+                    ESP_LOGI(TAG, "WS_GEMINI: Greeting JSON sent");
+                } else {
+                    ESP_LOGW(TAG, "WS_GEMINI: Greeting JSON gagal dikirim");
+                }
+            }
+
             if (websocket_gemini_setup_complete() &&
                 websocket_gemini_greeting_finished() &&
                 !audio_engine_input_session_active()) {
@@ -91,6 +107,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             (void)websocket_gemini_send_audio_stream_end(s_client);
         audio_engine_stop_input_session();
         s_connected = false;
+        s_greeting_sent = false;
         websocket_gemini_on_disconnected();
         ESP_LOGW(TAG, "WebSocket disconnected");
         break;
@@ -165,6 +182,7 @@ void websocket_disconnect(void)
     if (s_connected && audio_engine_input_session_active())
         (void)websocket_gemini_send_audio_stream_end(s_client);
     s_connected = false;
+    s_greeting_sent = false;
     audio_engine_stop_input_session();
     (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
 }
