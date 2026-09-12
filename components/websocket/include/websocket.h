@@ -15,27 +15,24 @@ extern "C" {
  *   Audio Engine -> WebSocket -> Gemini
  *   Gemini -> WebSocket -> Audio Engine
  *
- * Audio format, playback, I2S, and Gemini protocol details stay outside
- * this public transport API.
+ * I2S, microphone, speaker, DMA, audio buffers and audio processing remain
+ * in Audio HAL/Audio Engine. Gemini session state is exposed only as small
+ * transport lifecycle signals needed by app_startup.
  */
-
-/** Initialize the WebSocket transport layer. */
 void websocket_init(void);
-
-/** Connect the transport to the configured server. */
 bool websocket_connect(void);
-
-/** Disconnect the transport. */
 void websocket_disconnect(void);
-
-/** Return true when the transport is connected. */
 bool websocket_is_connected(void);
 
-/** Send an audio payload owned by the caller. */
+/* Audio payload is always PCM16/16kHz/mono/LE at this boundary. */
 bool websocket_send_audio(const uint8_t *data, size_t length);
-
-/** Send a text/control payload owned by the caller. */
 bool websocket_send_text(const char *text);
+
+/* Session lifecycle signals. */
+bool websocket_setup_complete(void);
+bool websocket_should_resume(void);
+bool websocket_take_resume_request(void);
+uint64_t websocket_goaway_time_left_ms(void);
 
 #ifdef __cplusplus
 }
