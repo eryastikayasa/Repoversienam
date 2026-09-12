@@ -7,6 +7,10 @@ CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_BOOT_INIT=y
 
+# FreeRTOS scheduler tick: 1 ms resolution.
+# Required by the existing audio_playback timing calls using pdMS_TO_TICKS(1/2).
+CONFIG_FREERTOS_HZ=1000
+
 # ESP-SR WakeNet9 - Hi ESP
 CONFIG_SR_WN_WN9_HIESP=y
 
