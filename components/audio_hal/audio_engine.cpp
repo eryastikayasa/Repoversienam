@@ -13,10 +13,12 @@
 static const char *TAG = "AUDIO_ENGINE";
 static constexpr uint32_t OUTPUT_RATE = 24000U;
 static constexpr size_t RING_BYTES = 64U * 1024U;
-static constexpr size_t PREBUFFER_BYTES = 6144U;
+static constexpr size_t PREBUFFER_BYTES = 6144U;       /* 256 ms */
 static constexpr size_t WARNING_BYTES = 3072U;
 static constexpr size_t CRITICAL_BYTES = 1024U;
-static constexpr size_t PLAYBACK_CHUNK = 640U;
+static constexpr size_t PLAYBACK_CHUNK = 640U;         /* 13.3 ms at 24 kHz */
+static constexpr TickType_t LOCK_TIMEOUT = pdMS_TO_TICKS(2);
+static constexpr TickType_t PLAYBACK_YIELD = pdMS_TO_TICKS(1);
 
 static volatile bool s_initialized = false;
 static volatile audio_engine_state_t s_state = AUDIO_ENGINE_IDLE;
@@ -54,12 +56,15 @@ static void set_state(audio_engine_state_t next)
     s_state = next;
 }
 
-static size_t pending_unlocked(void) { return s_stream ? xStreamBufferBytesAvailable(s_stream) : 0; }
+static size_t pending_unlocked(void)
+{
+    return s_stream ? xStreamBufferBytesAvailable(s_stream) : 0;
+}
 
 static size_t pending(void)
 {
     if (!s_stream) return 0;
-    if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) != pdTRUE) return 0;
+    if (s_lock && xSemaphoreTake(s_lock, LOCK_TIMEOUT) != pdTRUE) return 0;
     const size_t n = pending_unlocked();
     if (s_lock) xSemaphoreGive(s_lock);
     return n;
@@ -67,7 +72,10 @@ static size_t pending(void)
 
 static void flush_stream(void)
 {
-    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_lock && xSemaphoreTake(s_lock, LOCK_TIMEOUT) != pdTRUE) {
+        ESP_LOGW(TAG, "Playback flush deferred: mutex busy");
+        return;
+    }
     if (s_stream) xStreamBufferReset(s_stream);
     if (s_lock) xSemaphoreGive(s_lock);
     s_turn.pending_bytes = 0;
@@ -95,17 +103,45 @@ static void update_level(size_t n)
     else if (level == 2) ESP_LOGW(TAG, "Playback buffer low: %u B", (unsigned)n);
 }
 
+void audio_engine_log_diagnostics(const char *stage)
+{
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+
+    ESP_LOGI(TAG, "RAM AUDIT[%s] internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u minimum_free=%u",
+             stage ? stage : "unknown", (unsigned)internal_free, (unsigned)internal_largest,
+             (unsigned)psram_free, (unsigned)psram_largest, (unsigned)min_free);
+
+    if (s_playback_task) {
+        ESP_LOGI(TAG, "TASK AUDIT audio_playback stack=%uB watermark=%uB priority=%u core=%d",
+                 4096U, (unsigned)(uxTaskGetStackHighWaterMark(s_playback_task) * sizeof(StackType_t)),
+                 (unsigned)uxTaskPriorityGet(s_playback_task), (int)xTaskGetAffinity(s_playback_task));
+    }
+    ESP_LOGI(TAG, "AUDIO RAM MAP ring=%uB PSRAM/non-realtime prebuffer=%uB output_chunk=%uB",
+             (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK);
+}
+
 static void playback_task(void *arg)
 {
     (void)arg;
     static uint8_t pcm[PLAYBACK_CHUNK];
     bool started = false;
     int64_t last_stats_us = 0;
+    int64_t last_diag_us = 0;
+
     ESP_LOGI(TAG, "Playback task: PCM16 mono %uHz, ring=%uB, prebuffer=%uB, chunk=%uB",
-             (unsigned)OUTPUT_RATE, (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK);
+             (unsigned)OUTPUT_RATE, (unsigned)RING_BYTES,
+             (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK);
 
     for (;;) {
-        if (!s_stream) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (!s_stream) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
         const size_t before = pending();
         update_level(before);
         const bool active = audio_engine_turn_active();
@@ -116,7 +152,7 @@ static void playback_task(void *arg)
         }
 
         size_t got = 0;
-        if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        if (s_lock && xSemaphoreTake(s_lock, LOCK_TIMEOUT) == pdTRUE) {
             got = xStreamBufferReceive(s_stream, pcm, sizeof(pcm), 0);
             xSemaphoreGive(s_lock);
         } else if (!s_lock) {
@@ -142,7 +178,11 @@ static void playback_task(void *arg)
         }
 
         got &= ~((size_t)1);
-        if (!got) continue;
+        if (!got) {
+            vTaskDelay(PLAYBACK_YIELD);
+            continue;
+        }
+
         if (!started) {
             started = true;
             s_turn.playback_started = true;
@@ -169,22 +209,50 @@ static void playback_task(void *arg)
                      (unsigned long long)s_turn.playback_drop,
                      (unsigned long)s_turn.underrun_count);
         }
+        if (!last_diag_us || now - last_diag_us >= 5000000LL) {
+            last_diag_us = now;
+            audio_engine_log_diagnostics("playback");
+        }
+
+        /* I2S can return quickly while DMA has room. Never let this task
+         * continuously drain the software ring without yielding to IDLE0,
+         * WiFi and other realtime work. */
+        vTaskDelay(PLAYBACK_YIELD);
     }
 }
 
 bool audio_engine_init(void)
 {
     if (s_initialized) return true;
+
     s_stream_mem = (uint8_t *)heap_caps_malloc(RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_stream_mem) s_stream_mem = (uint8_t *)heap_caps_malloc(RING_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!s_stream_mem) { s_state = AUDIO_ENGINE_ERROR; ESP_LOGE(TAG, "Audio ring allocation gagal: %uB", (unsigned)RING_BYTES); return false; }
+    if (!s_stream_mem) {
+        ESP_LOGE(TAG, "Audio ring allocation gagal: %uB", (unsigned)RING_BYTES);
+        s_state = AUDIO_ENGINE_ERROR;
+        return false;
+    }
+
     s_stream = xStreamBufferCreateStatic(RING_BYTES, PLAYBACK_CHUNK, s_stream_mem, &s_stream_storage);
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
-    if (!s_stream || !s_lock) { s_state = AUDIO_ENGINE_ERROR; ESP_LOGE(TAG, "Audio stream/mutex init gagal"); return false; }
+    if (!s_stream || !s_lock) {
+        ESP_LOGE(TAG, "Audio stream/mutex init gagal");
+        s_state = AUDIO_ENGINE_ERROR;
+        return false;
+    }
+
     reset_turn(0);
-    if (xTaskCreatePinnedToCore(playback_task, "audio_playback", 4096, nullptr, 5, &s_playback_task, 0) != pdPASS) { s_state = AUDIO_ENGINE_ERROR; ESP_LOGE(TAG, "Playback task create gagal"); return false; }
+    if (xTaskCreatePinnedToCore(playback_task, "audio_playback", 4096, nullptr, 4, &s_playback_task, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Playback task create gagal");
+        s_state = AUDIO_ENGINE_ERROR;
+        return false;
+    }
+
     s_initialized = true;
-    ESP_LOGI(TAG, "AudioEngine aktif: output=PCM16/24kHz, ring=%uB, prebuffer=%uB", (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES);
+    ESP_LOGI(TAG, "AudioEngine aktif: output=PCM16/24kHz, ring=%uB PSRAM, prebuffer=%uB (~%ums)",
+             (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES,
+             (unsigned)((PREBUFFER_BYTES * 1000U) / (OUTPUT_RATE * 2U)));
+    audio_engine_log_diagnostics("init");
     return true;
 }
 
@@ -197,8 +265,10 @@ bool audio_engine_turn_active(void)
         case AUDIO_ENGINE_BUFFERING:
         case AUDIO_ENGINE_PLAYING:
         case AUDIO_ENGINE_PLAYING_LOW:
-        case AUDIO_ENGINE_DRAINING: return true;
-        default: return false;
+        case AUDIO_ENGINE_DRAINING:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -207,25 +277,43 @@ const audio_engine_turn_t *audio_engine_get_turn(void) { return &s_turn; }
 void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 {
     if (!s_initialized) return;
+
     if (event == AUDIO_ENGINE_EVENT_GENERATION_CHANGED) {
-        flush_stream(); reset_turn(generation); set_state(AUDIO_ENGINE_IDLE); return;
+        flush_stream();
+        reset_turn(generation);
+        set_state(AUDIO_ENGINE_IDLE);
+        return;
     }
+
     if (generation && s_turn.generation && generation != s_turn.generation) return;
     if (generation && !s_turn.generation) s_turn.generation = generation;
 
     switch (event) {
         case AUDIO_ENGINE_EVENT_MODEL_BEGIN:
-            flush_stream(); reset_turn(generation); set_state(AUDIO_ENGINE_BUFFERING); break;
+            flush_stream();
+            reset_turn(generation);
+            set_state(AUDIO_ENGINE_BUFFERING);
+            audio_engine_log_diagnostics("model_begin");
+            break;
         case AUDIO_ENGINE_EVENT_MODEL_AUDIO:
             s_turn.model_started = true;
-            if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE) set_state(AUDIO_ENGINE_BUFFERING);
+            if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE)
+                set_state(AUDIO_ENGINE_BUFFERING);
             break;
         case AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE:
-            s_turn.model_complete = true; set_state(AUDIO_ENGINE_DRAINING); break;
+            s_turn.model_complete = true;
+            set_state(AUDIO_ENGINE_DRAINING);
+            break;
         case AUDIO_ENGINE_EVENT_INTERRUPT:
-            flush_stream(); s_turn.playback_drained = true; set_state(AUDIO_ENGINE_INTERRUPTED); break;
-        case AUDIO_ENGINE_EVENT_ERROR: set_state(AUDIO_ENGINE_ERROR); break;
-        default: break;
+            flush_stream();
+            s_turn.playback_drained = true;
+            set_state(AUDIO_ENGINE_INTERRUPTED);
+            break;
+        case AUDIO_ENGINE_EVENT_ERROR:
+            set_state(AUDIO_ENGINE_ERROR);
+            break;
+        default:
+            break;
     }
 }
 
@@ -236,9 +324,6 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
     len &= ~((size_t)1);
     if (!len) return false;
 
-    /* A new model response starts a new playback turn. Do this before the
-     * bytes enter the ring so stale model_complete/INTERRUPTED state cannot
-     * cause the first PCM chunk to be treated as already drained. */
     if (s_turn.model_complete || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE) {
         flush_stream();
         reset_turn(generation ? generation : s_turn.generation);
@@ -249,17 +334,23 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
     while (offset < len) {
         const size_t chunk = (len - offset > PLAYBACK_CHUNK) ? PLAYBACK_CHUNK : (len - offset);
         size_t written = 0;
-        if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+        if (s_lock && xSemaphoreTake(s_lock, LOCK_TIMEOUT) == pdTRUE) {
             written = xStreamBufferSend(s_stream, pcm + offset, chunk, 0);
             xSemaphoreGive(s_lock);
         } else if (!s_lock) {
             written = xStreamBufferSend(s_stream, pcm + offset, chunk, 0);
         }
-        if (!written) { s_turn.network_drop += len - offset; return offset != 0; }
+        if (!written) {
+            s_turn.network_drop += len - offset;
+            return offset != 0;
+        }
         s_turn.bytes_received += written;
         s_turn.bytes_queued += written;
         offset += written;
-        if (written < chunk) { s_turn.network_drop += chunk - written; return true; }
+        if (written < chunk) {
+            s_turn.network_drop += chunk - written;
+            return true;
+        }
     }
     return true;
 }
