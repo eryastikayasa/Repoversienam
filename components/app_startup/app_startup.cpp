@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -18,10 +19,57 @@ static const char *TAG = "APP_STARTUP";
 static volatile bool s_assistant_requested = false;
 static bool s_session_was_connected = false;
 
+static constexpr gpio_num_t BOOT_BUTTON_GPIO = GPIO_NUM_0;
+static constexpr TickType_t BOOT_BUTTON_DEBOUNCE = pdMS_TO_TICKS(50);
+static int s_boot_raw_level = 1;
+static int s_boot_stable_level = 1;
+static TickType_t s_boot_last_change = 0;
+
 static void on_wakeword_detected(void *ctx)
 {
     (void)ctx;
     s_assistant_requested = true;
+}
+
+static void boot_button_init(void)
+{
+    gpio_config_t config = {};
+    config.pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO;
+    config.mode = GPIO_MODE_INPUT;
+    config.pull_up_en = GPIO_PULLUP_ENABLE;
+    config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    config.intr_type = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&config));
+
+    const int level = gpio_get_level(BOOT_BUTTON_GPIO);
+    s_boot_raw_level = level;
+    s_boot_stable_level = level;
+    s_boot_last_change = xTaskGetTickCount();
+    ESP_LOGI(TAG, "BOOT button siap: GPIO0 active-low");
+}
+
+static void boot_button_poll(void)
+{
+    const TickType_t now = xTaskGetTickCount();
+    const int raw_level = gpio_get_level(BOOT_BUTTON_GPIO);
+
+    if (raw_level != s_boot_raw_level) {
+        s_boot_raw_level = raw_level;
+        s_boot_last_change = now;
+        return;
+    }
+
+    if (raw_level != s_boot_stable_level &&
+        (TickType_t)(now - s_boot_last_change) >= BOOT_BUTTON_DEBOUNCE) {
+        const int previous_level = s_boot_stable_level;
+        s_boot_stable_level = raw_level;
+
+        if (previous_level == 1 && s_boot_stable_level == 0 &&
+            !s_assistant_requested && !websocket_is_connected()) {
+            ESP_LOGI(TAG, "BOOT Button -> buka sesi Gemini");
+            s_assistant_requested = true;
+        }
+    }
 }
 
 static void log_main_task_audit(const char *stage)
@@ -85,16 +133,20 @@ extern "C" void app_startup_run(void)
     if (!wakeword_init()) return;
     if (!wakeword_start(on_wakeword_detected, nullptr)) return;
     if (!audio_engine_start_capture()) return;
+    boot_button_init();
 
     ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi -> Wake Word");
     ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
+    ESP_LOGI(TAG, "BOOT button aktif: GPIO0");
     audio_engine_log_diagnostics("wakeword_ready");
     log_main_task_audit("wakeword_ready");
 
     for (;;) {
+        boot_button_poll();
+
         if (s_assistant_requested && !websocket_is_connected()) {
             s_assistant_requested = false;
-            ESP_LOGI(TAG, "Wake Word -> buka sesi Gemini");
+            ESP_LOGI(TAG, "Trigger -> buka sesi Gemini");
             websocket_init();
             if (!websocket_connect()) {
                 ESP_LOGW(TAG, "WebSocket Gemini gagal -> Wake Word");
