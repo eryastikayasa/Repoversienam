@@ -5,7 +5,7 @@
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "mbedtls/base64.h"
-#include "cJSON.h"
+#include "freertos/FreeRTOS.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,56 +13,144 @@
 
 static const char *TAG = "WS_GEMINI";
 
+static bool contains_bytes(const uint8_t *data, size_t len,
+                           const char *needle)
+{
+    if (!data || len == 0 || !needle || needle[0] == '\0') return false;
+    const size_t nlen = strlen(needle);
+    if (nlen > len) return false;
+
+    for (size_t i = 0; i + nlen <= len; ++i) {
+        if (memcmp(data + i, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
+static bool find_inline_audio(const uint8_t *data, size_t len,
+                              const char **out_b64, size_t *out_len)
+{
+    if (!data || len == 0 || !out_b64 || !out_len) return false;
+    *out_b64 = nullptr;
+    *out_len = 0;
+
+    static const char key[] = "\"inlineData\"";
+    static const char data_key[] = "\"data\"";
+    const size_t key_len = sizeof(key) - 1U;
+    const size_t data_key_len = sizeof(data_key) - 1U;
+
+    size_t inline_pos = len;
+    for (size_t i = 0; i + key_len <= len; ++i) {
+        if (memcmp(data + i, key, key_len) == 0) {
+            inline_pos = i + key_len;
+            break;
+        }
+    }
+    if (inline_pos == len) return false;
+
+    size_t data_pos = len;
+    for (size_t i = inline_pos; i + data_key_len <= len; ++i) {
+        if (memcmp(data + i, data_key, data_key_len) == 0) {
+            data_pos = i + data_key_len;
+            break;
+        }
+        if (data[i] == '}') break;
+    }
+    if (data_pos == len) return false;
+
+    while (data_pos < len &&
+           (data[data_pos] == ' ' || data[data_pos] == '\t' ||
+            data[data_pos] == '\r' || data[data_pos] == '\n' ||
+            data[data_pos] == ':')) {
+        ++data_pos;
+    }
+    if (data_pos >= len || data[data_pos] != '"') return false;
+    ++data_pos;
+
+    const size_t start = data_pos;
+    for (size_t i = start; i < len; ++i) {
+        if (data[i] == '\\') return false;
+        if (data[i] == '"') {
+            *out_b64 = reinterpret_cast<const char *>(data + start);
+            *out_len = i - start;
+            return *out_len > 0;
+        }
+    }
+    return false;
+}
+
 static bool send_setup(esp_websocket_client_handle_t client)
 {
     if (!client) return false;
 
-    cJSON *root = cJSON_CreateObject();
-    if (!root) return false;
-
-    cJSON *setup = cJSON_AddObjectToObject(root, "setup");
-    cJSON *generation = cJSON_AddObjectToObject(setup, "generationConfig");
-    cJSON *modalities = cJSON_AddArrayToObject(generation, "responseModalities");
-    cJSON_AddItemToArray(modalities, cJSON_CreateString("AUDIO"));
-
-    cJSON *speech = cJSON_AddObjectToObject(generation, "speechConfig");
-    cJSON_AddStringToObject(speech, "languageCode", "id-ID");
-    cJSON *voice = cJSON_AddObjectToObject(speech, "voiceConfig");
-    cJSON *prebuilt = cJSON_AddObjectToObject(voice, "prebuiltVoiceConfig");
-    cJSON_AddStringToObject(prebuilt, "voiceName", "Kore");
-
-    cJSON_AddStringToObject(
-        setup, "model", "models/gemini-3.1-flash-live-preview");
-    cJSON_AddObjectToObject(setup, "inputAudioTranscription");
-
     char role[2048] = {0};
-    if (web_config_load_role(role, sizeof(role)) && role[0] != '\0') {
-        cJSON *instruction = cJSON_AddObjectToObject(setup, "systemInstruction");
-        cJSON *parts = cJSON_AddArrayToObject(instruction, "parts");
-        cJSON *part = cJSON_CreateObject();
-        cJSON_AddStringToObject(part, "text", role);
-        cJSON_AddItemToArray(parts, part);
-    }
+    const bool have_role = web_config_load_role(role, sizeof(role)) && role[0] != '\0';
 
-    cJSON *realtime = cJSON_AddObjectToObject(setup, "realtimeInputConfig");
-    cJSON *vad = cJSON_AddObjectToObject(realtime, "automaticActivityDetection");
-    cJSON_AddBoolToObject(vad, "disabled", false);
-    cJSON_AddStringToObject(vad, "startOfSpeechSensitivity", "START_SENSITIVITY_HIGH");
-    cJSON_AddNumberToObject(vad, "prefixPaddingMs", 40);
-    cJSON_AddStringToObject(vad, "endOfSpeechSensitivity", "END_SENSITIVITY_HIGH");
-    cJSON_AddNumberToObject(vad, "silenceDurationMs", 500);
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
+    const size_t role_extra = have_role ? strlen(role) + 180U : 1U;
+    const size_t capacity = 1400U + role_extra;
+    char *json = static_cast<char *>(malloc(capacity));
     if (!json) return false;
 
-    const int len = (int)strlen(json);
+    int n;
+    if (have_role) {
+        size_t escaped_len = 0;
+        for (size_t i = 0; role[i] != '\0'; ++i) {
+            const unsigned char c = (unsigned char)role[i];
+            escaped_len += (c == '"' || c == '\\' || c < 0x20U) ? 2U : 1U;
+        }
+        char *escaped = static_cast<char *>(malloc(escaped_len + 1U));
+        if (!escaped) {
+            free(json);
+            return false;
+        }
+        size_t p = 0;
+        for (size_t i = 0; role[i] != '\0'; ++i) {
+            const unsigned char c = (unsigned char)role[i];
+            if (c == '"') { escaped[p++] = '\\'; escaped[p++] = '"'; }
+            else if (c == '\\') { escaped[p++] = '\\'; escaped[p++] = '\\'; }
+            else if (c < 0x20U) { escaped[p++] = ' '; }
+            else { escaped[p++] = (char)c; }
+        }
+        escaped[p] = '\0';
+
+        n = snprintf(
+            json, capacity,
+            "{\"setup\":{\"model\":\"models/gemini-3.1-flash-live-preview\","
+            "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
+            "\"speechConfig\":{\"languageCode\":\"id-ID\",\"voiceConfig\":{"
+            "\"prebuiltVoiceConfig\":{\"voiceName\":\"Kore\"}}}},"
+            "\"inputAudioTranscription\":{},\"systemInstruction\":{\"parts\":["
+            "{\"text\":\"%s\"}]},\"realtimeInputConfig\":{"
+            "\"automaticActivityDetection\":{\"disabled\":false,"
+            "\"startOfSpeechSensitivity\":\"START_SENSITIVITY_HIGH\","
+            "\"prefixPaddingMs\":40,\"endOfSpeechSensitivity\":"
+            "\"END_SENSITIVITY_HIGH\",\"silenceDurationMs\":500}}}}}",
+            escaped);
+        free(escaped);
+    } else {
+        n = snprintf(
+            json, capacity,
+            "{\"setup\":{\"model\":\"models/gemini-3.1-flash-live-preview\","
+            "\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],"
+            "\"speechConfig\":{\"languageCode\":\"id-ID\",\"voiceConfig\":{"
+            "\"prebuiltVoiceConfig\":{\"voiceName\":\"Kore\"}}}},"
+            "\"inputAudioTranscription\":{},\"realtimeInputConfig\":{"
+            "\"automaticActivityDetection\":{\"disabled\":false,"
+            "\"startOfSpeechSensitivity\":\"START_SENSITIVITY_HIGH\","
+            "\"prefixPaddingMs\":40,\"endOfSpeechSensitivity\":"
+            "\"END_SENSITIVITY_HIGH\",\"silenceDurationMs\":500}}}}}");
+    }
+
+    if (n <= 0 || (size_t)n >= capacity) {
+        free(json);
+        return false;
+    }
+
     const int sent = esp_websocket_client_send_text(
-        client, json, len, pdMS_TO_TICKS(5000));
+        client, json, n, pdMS_TO_TICKS(5000));
     free(json);
 
-    if (sent != len) {
-        ESP_LOGE(TAG, "Gemini setup gagal: sent=%d expected=%d", sent, len);
+    if (sent != n) {
+        ESP_LOGE(TAG, "Gemini setup gagal: sent=%d expected=%d", sent, n);
         return false;
     }
 
@@ -73,10 +161,10 @@ static bool send_setup(esp_websocket_client_handle_t client)
 static bool send_audio_frame(esp_websocket_client_handle_t client,
                              const uint8_t *data, size_t len)
 {
-    if (!client || !data || len == 0 || len > 1600) return false;
+    if (!client || !data || len == 0 || len > 1600U) return false;
 
     const size_t b64_capacity = ((len + 2U) / 3U) * 4U + 1U;
-    const size_t json_capacity = b64_capacity + 160U;
+    const size_t json_capacity = b64_capacity + 180U;
     char *b64 = static_cast<char *>(malloc(b64_capacity));
     char *json = static_cast<char *>(malloc(json_capacity));
     if (!b64 || !json) {
@@ -86,7 +174,7 @@ static bool send_audio_frame(esp_websocket_client_handle_t client,
     }
 
     size_t b64_len = 0;
-    int ret = mbedtls_base64_encode(
+    const int ret = mbedtls_base64_encode(
         reinterpret_cast<unsigned char *>(b64),
         b64_capacity - 1U,
         &b64_len,
@@ -99,13 +187,13 @@ static bool send_audio_frame(esp_websocket_client_handle_t client,
     }
     b64[b64_len] = '\0';
 
-    int json_len = snprintf(
+    const int json_len = snprintf(
         json,
         json_capacity,
         "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
         b64);
-
     free(b64);
+
     if (json_len <= 0 || (size_t)json_len >= json_capacity) {
         free(json);
         return false;
@@ -115,40 +203,6 @@ static bool send_audio_frame(esp_websocket_client_handle_t client,
         client, json, json_len, pdMS_TO_TICKS(3000));
     free(json);
     return sent == json_len;
-}
-
-static bool extract_inline_audio(const uint8_t *data, size_t len,
-                                 const char **out_b64, size_t *out_len)
-{
-    if (!data || len == 0 || !out_b64 || !out_len) return false;
-    *out_b64 = nullptr;
-    *out_len = 0;
-
-    const char *text = reinterpret_cast<const char *>(data);
-    const char *inline_data = strstr(text, "\"inlineData\"");
-    if (!inline_data) return false;
-
-    const char *data_key = strstr(inline_data, "\"data\"");
-    if (!data_key || data_key >= text + len) return false;
-
-    const char *p = strchr(data_key, ':');
-    if (!p || p >= text + len) return false;
-    ++p;
-    while (p < text + len && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
-    if (p >= text + len || *p != '\"') return false;
-    ++p;
-
-    const char *end = p;
-    while (end < text + len) {
-        if (*end == '\\') return false;
-        if (*end == '\"') break;
-        ++end;
-    }
-    if (end >= text + len) return false;
-
-    *out_b64 = p;
-    *out_len = static_cast<size_t>(end - p);
-    return *out_len > 0;
 }
 
 extern "C" bool websocket_gemini_on_connected(
@@ -169,21 +223,23 @@ extern "C" void websocket_gemini_on_data(
     (void)opcode;
     if (!data || len == 0) return;
 
-    /* Gemini audio is delivered as inlineData.data (Base64). Keep the
-     * Base64 payload out of cJSON so large audio responses do not create an
-     * unnecessary second decoded/parsed buffer. Audio Engine owns ingest. */
     const char *b64 = nullptr;
     size_t b64_len = 0;
-    if (extract_inline_audio(data, len, &b64, &b64_len)) {
-        audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_BEGIN, generation);
-        if (!audio_engine_push_model_audio_base64(b64, b64_len, generation)) {
-            ESP_LOGW(TAG, "AudioEngine menolak audio Gemini: %u byte Base64",
+    if (find_inline_audio(data, len, &b64, &b64_len)) {
+        if (audio_engine_push_model_audio_base64(b64, b64_len, generation)) {
+            audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_AUDIO, generation);
+        } else {
+            ESP_LOGW(TAG, "AudioEngine menolak audio Gemini: %u Base64",
                      (unsigned)b64_len);
         }
     }
 
-    if (len >= 18 && strstr(reinterpret_cast<const char *>(data), "\"turnComplete\":true")) {
+    if (contains_bytes(data, len, "\"turnComplete\":true")) {
         audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE, generation);
+    }
+
+    if (contains_bytes(data, len, "\"interrupted\":true")) {
+        audio_engine_notify(AUDIO_ENGINE_EVENT_INTERRUPT, generation);
     }
 }
 
