@@ -128,7 +128,7 @@ WebSocket tidak mengambil ownership buffer audio utama.
 11. Wake Word menerima audio melalui Audio Engine.
 12. Wake Word menjadi gerbang sebelum sesi Gemini.
 13. Tidak boleh ada task raksasa yang mengurus seluruh sistem.
-14. `main.cpp` tetap kosong.
+
 
 ## Struktur Utama
 
@@ -359,3 +359,23 @@ Base64 JSON
  ↓
 Gemini
 Kesimpulannya: iya, ada aturan yang cukup jelas untuk buffer dan streaming.
+
+tambahan
+
+BOOT / WAKE WORD
+ ↓
+WebSocket
+ ↓
+Gemini setupComplete
+ ↓
+KIRIM PEMICU UNTUK RESPONS AWAL
+ ↓
+Gemini menghasilkan audio
+ ↓
+Audio Engine
+ ↓
+Speaker
+ ↓
+"Halo, ada yang bisa dibantu?"
+ ↓
+baru MIC aktif untuk user
