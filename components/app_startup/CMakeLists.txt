@@ -3,7 +3,6 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES
         audio_hal
-        audio_engine
         display
         uart_control
         web_config
