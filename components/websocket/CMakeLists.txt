@@ -4,4 +4,12 @@ idf_component_register(
         "websocket_gemini.cpp"
     INCLUDE_DIRS
         "include"
+    REQUIRES
+        esp_websocket_client
+        esp-tls
+        mbedtls
+        esp_timer
+        audio_hal
+        web_config
+        cjson
 )
