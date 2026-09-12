@@ -16,9 +16,12 @@ static constexpr size_t RX_CAP = 32768;
 static EXT_RAM_BSS_ATTR char s_rx[RX_CAP];
 static size_t s_rx_len = 0;
 static volatile bool s_setup_complete = false;
+static volatile bool s_greeting_started = false;
+static volatile bool s_greeting_complete = false;
 static volatile bool s_resume_available = false;
 static EXT_RAM_BSS_ATTR char s_resume_handle[4096] = {0};
 static uint64_t s_goaway_ms = 0;
+static esp_websocket_client_handle_t s_client = nullptr;
 
 /* Large setup/send scratch buffers are persistent because the WebSocket
  * transport is serialized through its event task. They are data buffers, not
@@ -85,6 +88,22 @@ static void parse_goaway(const uint8_t *d, size_t n)
     }
 }
 
+static bool send_initial_greeting(void)
+{
+    if (!s_client || s_greeting_started) return false;
+    static const char msg[] =
+        "{\"clientContent\":{\"turns\":[{\"role\":\"user\",\"parts\":[{\"text\":\""
+        "Mulai percakapan dengan mengucapkan tepat: Halo, ada yang bisa dibantu?"
+        "\"}]}],\"turnComplete\":true}}";
+    const int n = (int)(sizeof(msg) - 1);
+    const int sent = esp_websocket_client_send_text(s_client, msg, n, pdMS_TO_TICKS(1000));
+    if (sent != n) return false;
+    s_greeting_started = true;
+    s_greeting_complete = false;
+    ESP_LOGI(TAG, "Gemini greeting trigger sent");
+    return true;
+}
+
 static bool find_audio(const uint8_t *d, size_t n, const char **out, size_t *out_n)
 {
     static const char ik[] = "\"inlineData\"";
@@ -114,8 +133,13 @@ static bool find_audio(const uint8_t *d, size_t n, const char **out, size_t *out
 static void process_json(const uint8_t *d, size_t n, uint32_t gen)
 {
     if (has(d, n, "\"setupComplete\"")) {
+        const bool was_complete = s_setup_complete;
         s_setup_complete = true;
         ESP_LOGI(TAG, "Gemini setupComplete");
+        if (!was_complete && !s_greeting_started) {
+            if (!send_initial_greeting())
+                ESP_LOGW(TAG, "Gemini greeting trigger gagal dikirim");
+        }
     }
     if (has(d, n, "\"sessionResumptionUpdate\"")) {
         const bool resumable = has(d, n, "\"resumable\":true");
@@ -137,8 +161,13 @@ static void process_json(const uint8_t *d, size_t n, uint32_t gen)
         ESP_LOGW(TAG, "Gemini interrupted -> flush playback");
         audio_engine_notify(AUDIO_ENGINE_EVENT_INTERRUPT, gen);
     }
-    if (has(d, n, "\"generationComplete\":true") || has(d, n, "\"turnComplete\":true"))
+    if (has(d, n, "\"generationComplete\":true") || has(d, n, "\"turnComplete\":true")) {
+        if (s_greeting_started && !s_greeting_complete) {
+            s_greeting_complete = true;
+            ESP_LOGI(TAG, "Gemini greeting selesai -> MIC streaming boleh dimulai");
+        }
         audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE, gen);
+    }
 }
 
 static void reset_parser(void) { s_rx_len = 0; }
@@ -199,7 +228,10 @@ static bool send_setup(esp_websocket_client_handle_t client)
     const int sent = esp_websocket_client_send_text(client, s_setup_json, n, pdMS_TO_TICKS(2000));
     if (sent != n) return false;
     s_setup_complete = false;
+    s_greeting_started = false;
+    s_greeting_complete = false;
     s_goaway_ms = 0;
+    s_client = client;
     ESP_LOGI(TAG, "Gemini setup sent%s", s_resume_available ? " with session resume" : "");
     return true;
 }
@@ -215,10 +247,11 @@ static bool send_audio_frame(esp_websocket_client_handle_t client, const uint8_t
     return esp_websocket_client_send_text(client, s_audio_json, n, pdMS_TO_TICKS(100)) == n;
 }
 
-extern "C" bool websocket_gemini_on_connected(esp_websocket_client_handle_t client, uint32_t generation) { (void)generation; reset_parser(); return send_setup(client); }
-extern "C" void websocket_gemini_on_disconnected(void) { reset_parser(); s_setup_complete = false; ESP_LOGW(TAG, "Gemini disconnected"); }
+extern "C" bool websocket_gemini_on_connected(esp_websocket_client_handle_t client, uint32_t generation) { (void)generation; reset_parser(); s_client = client; return send_setup(client); }
+extern "C" void websocket_gemini_on_disconnected(void) { reset_parser(); s_setup_complete = false; s_greeting_started = false; s_greeting_complete = false; s_client = nullptr; ESP_LOGW(TAG, "Gemini disconnected"); }
 extern "C" void websocket_gemini_on_data(const uint8_t *data, size_t len, int opcode, uint32_t generation) { (void)opcode; feed_json(data, len, generation); }
 extern "C" bool websocket_gemini_setup_complete(void) { return s_setup_complete; }
+extern "C" bool websocket_gemini_greeting_complete(void) { return s_greeting_complete; }
 extern "C" bool websocket_gemini_should_resume(void) { return s_resume_available; }
 extern "C" uint64_t websocket_gemini_goaway_time_left_ms(void) { return s_goaway_ms; }
 extern "C" bool websocket_gemini_send_audio(esp_websocket_client_handle_t client, const uint8_t *data, size_t len) { return send_audio_frame(client, data, len); }
