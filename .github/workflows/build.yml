@@ -1,0 +1,216 @@
+name: Build ESP32-S3 Firmware
+
+on:
+  push:
+    branches:
+      - main
+      - webconfig-from-satu
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ESP32-S3 Firmware
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Check PlatformIO
+        run: pio --version
+
+      - name: Check Build Environment
+        run: |
+          set -euo pipefail
+          pio platform show espressif32
+          pio pkg list
+          pio run -t clean
+
+      - name: Build ESP32-S3
+        run: pio run
+
+      - name: Download ESP-SR v2.4.5 model source
+        run: |
+          set -euo pipefail
+          ESP_SR_COMMIT="5fadfbd5bd9df756f543973bd43520d9270ffb1b"
+          SRC_DIR="$RUNNER_TEMP/esp-sr-v2.4.5"
+          rm -rf "$SRC_DIR"
+          mkdir -p "$SRC_DIR"
+          cd "$SRC_DIR"
+          git init
+          git remote add origin https://github.com/espressif/esp-sr.git
+          git config core.sparseCheckout true
+          git sparse-checkout set model/wakenet_model/wn9_hiesp model/nsnet_model/nsnet2
+          git fetch --depth 1 origin "$ESP_SR_COMMIT"
+          git checkout --detach FETCH_HEAD
+          MODEL_SRC="$SRC_DIR/model/wakenet_model/wn9_hiesp"
+          NS_MODEL_SRC="$SRC_DIR/model/nsnet_model/nsnet2"
+          test -d "$MODEL_SRC"
+          test -s "$MODEL_SRC/wn9_index"
+          test -s "$MODEL_SRC/wn9_data"
+          test -d "$NS_MODEL_SRC"
+          test -n "$(find "$NS_MODEL_SRC" -type f -print -quit)"
+          echo "ESP-SR v2.4.5 commit: $ESP_SR_COMMIT"
+          echo "WakeNet model source: $MODEL_SRC"
+          echo "NSNet2 model source: $NS_MODEL_SRC"
+          ls -lah "$MODEL_SRC"
+          ls -lah "$NS_MODEL_SRC"
+
+      - name: Generate ESP-SR srmodels.bin with repository pack_model.py
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -euo pipefail
+          set -x
+          BUILD="$PWD/.pio/build/esp32-s3-devkitc-1"
+          test -d "$BUILD"
+          if [ -f "$PWD/sdkconfig" ]; then SDKCONFIG="$PWD/sdkconfig"; else SDKCONFIG="$(find "$PWD" -maxdepth 1 -type f -name 'sdkconfig.*' ! -name 'sdkconfig.defaults' -print -quit)"; fi
+          test -n "$SDKCONFIG" && test -f "$SDKCONFIG"
+          PACKER="$PWD/scripts/pack_model.py"
+          test -f "$PACKER"
+          MODEL_SRC="$RUNNER_TEMP/esp-sr-v2.4.5/model/wakenet_model/wn9_hiesp"
+          NS_MODEL_SRC="$RUNNER_TEMP/esp-sr-v2.4.5/model/nsnet_model/nsnet2"
+          test -d "$MODEL_SRC"
+          test -s "$MODEL_SRC/wn9_index"
+          test -s "$MODEL_SRC/wn9_data"
+          test -d "$NS_MODEL_SRC"
+          echo "=== ESP-SR MODEL DIAGNOSTIC ==="
+          echo "Final sdkconfig: $SDKCONFIG"
+          echo "Repository packer: $PACKER"
+          echo "Python: $(python --version)"
+          echo "ESP-SR v2.4.5 WakeNet source: $MODEL_SRC"
+          echo "ESP-SR v2.4.5 NSNet2 source: $NS_MODEL_SRC"
+          grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" || true
+          grep -E '^CONFIG_SR_WN_WN9_HIESP=y$' "$SDKCONFIG"
+          grep -E '^CONFIG_SR_NSN_NSNET2=y$' "$SDKCONFIG"
+          echo "--- source model files ---"
+          ls -lah "$MODEL_SRC"
+          ls -lah "$NS_MODEL_SRC"
+          echo "--- packer syntax check ---"
+          python -m py_compile "$PACKER"
+          mkdir -p "$BUILD/srmodels"
+          rm -f "$BUILD/srmodels/srmodels.bin"
+          rm -rf "$BUILD/srmodels/wn9_hiesp" "$BUILD/srmodels/nsnet2"
+          cp -a "$MODEL_SRC" "$BUILD/srmodels/wn9_hiesp"
+          cp -a "$NS_MODEL_SRC" "$BUILD/srmodels/nsnet2"
+          MODEL="$BUILD/srmodels/srmodels.bin"
+          echo "=== RUN ESP-SR pack_model.py ==="
+          python -u "$PACKER" -m "$BUILD/srmodels" -o "$MODEL"
+          echo "--- generated srmodels tree ---"
+          find "$BUILD/srmodels" -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+          test -s "$MODEL"
+          test -s "$BUILD/srmodels/wn9_hiesp/wn9_index"
+          test -s "$BUILD/srmodels/wn9_hiesp/wn9_data"
+          test -d "$BUILD/srmodels/nsnet2"
+          test -n "$(find "$BUILD/srmodels/nsnet2" -type f -print -quit)"
+          MODEL_SIZE=$(stat -c %s "$BUILD/srmodels/srmodels.bin")
+          test "$MODEL_SIZE" -le $((0x400000))
+          grep -a -q "wn9_hiesp" "$MODEL"
+          grep -a -q "nsnet2" "$MODEL"
+          echo "ESP-SR model image: $MODEL"
+          echo "ESP-SR model size: $MODEL_SIZE bytes"
+          echo "ESP-SR pack_model.py: PASS"
+          echo "WakeNet9 Hi ESP model files: PASS"
+          echo "NSNet2 model files: PASS"
+
+      - name: Audit final sdkconfig, 16MB flash and ESP-SR models
+        run: |
+          set -euo pipefail
+          BUILD=.pio/build/esp32-s3-devkitc-1
+          test -d "$BUILD"
+          if [ -f sdkconfig ]; then SDKCONFIG=sdkconfig; else SDKCONFIG="$(find . -maxdepth 1 -type f -name 'sdkconfig.*' ! -name 'sdkconfig.defaults' -print -quit)"; fi
+          test -n "$SDKCONFIG" && test -f "$SDKCONFIG"
+          echo "Final sdkconfig: $SDKCONFIG"
+          grep -E '^CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y$' "$SDKCONFIG"
+          grep -E '^CONFIG_ESPTOOLPY_FLASHSIZE=\"16MB\"$' "$SDKCONFIG"
+          grep -E '^CONFIG_PARTITION_TABLE_CUSTOM=y$' "$SDKCONFIG"
+          grep -E '^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/partitions.csv\"$' "$SDKCONFIG"
+          grep -E '^model,.*0x400000' partitions/partitions.csv
+          grep -E '^CONFIG_SR_WN_WN9_HIESP=y$' "$SDKCONFIG"
+          grep -E '^CONFIG_SR_NSN_NSNET2=y$' "$SDKCONFIG"
+          test -f "$BUILD/firmware.bin"
+          test -f "$BUILD/bootloader.bin"
+          test -f "$BUILD/partitions.bin"
+          test -f "$BUILD/firmware.elf"
+          test -s "$BUILD/srmodels/srmodels.bin"
+          test -s "$BUILD/srmodels/wn9_hiesp/wn9_index"
+          test -s "$BUILD/srmodels/wn9_hiesp/wn9_data"
+          test -d "$BUILD/srmodels/nsnet2"
+          test -n "$(find "$BUILD/srmodels/nsnet2" -type f -print -quit)"
+          grep -a -q "wn9_hiesp" "$BUILD/srmodels/srmodels.bin"
+          grep -a -q "nsnet2" "$BUILD/srmodels/srmodels.bin"
+          MODEL_SIZE=$(stat -c %s "$BUILD/srmodels/srmodels.bin")
+          test "$MODEL_SIZE" -le $((0x400000))
+          echo "Flash size: 16MB PASS"
+          echo "Custom partition table: PASS"
+          echo "WakeNet9 Hi ESP config: PASS"
+          echo "NSNet2 config: PASS"
+          echo "ESP-SR model generation: PASS"
+          echo "WakeNet9 model payload: PASS"
+          echo "NSNet2 model payload: PASS"
+          echo "Model partition capacity (4MiB): PASS"
+
+      - name: Audit final sdkconfig and CA bundle
+        run: |
+          set -euo pipefail
+          BUILD=.pio/build/esp32-s3-devkitc-1
+          if [ -f sdkconfig ]; then SDKCONFIG=sdkconfig; else SDKCONFIG="$(find . -maxdepth 1 -type f -name 'sdkconfig.*' ! -name 'sdkconfig.defaults' -print -quit)"; fi
+          ELF="$BUILD/firmware.elf"
+          grep -E '^(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE|CONFIG_MBEDTLS_DEFAULT_CERTIFICATE_BUNDLE|CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL|CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY)=' "$SDKCONFIG"
+          test "$(grep -E '^CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y$' "$SDKCONFIG" | wc -l)" -eq 1
+          test "$(grep -E '^CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y$' "$SDKCONFIG" | wc -l)" -eq 1
+          test "$(grep -E '^CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y$' "$SDKCONFIG" | wc -l)" -eq 1
+          readelf -Ws "$ELF" | grep -E '_binary_x509_crt_bundle_(start|end)'
+          test "$(readelf -Ws "$ELF" | grep -c '_binary_x509_crt_bundle_start')" -ge 1
+          test "$(readelf -Ws "$ELF" | grep -c '_binary_x509_crt_bundle_end')" -ge 1
+          echo "CA bundle Kconfig: PASS"
+          echo "Embedded x509 certificate bundle: PASS"
+
+      - name: Final compatibility gate
+        run: |
+          set -euo pipefail
+          BUILD=.pio/build/esp32-s3-devkitc-1
+          test -f "$BUILD/firmware.bin"
+          test -f "$BUILD/bootloader.bin"
+          test -f "$BUILD/partitions.bin"
+          test -f "$BUILD/firmware.elf"
+          test -s "$BUILD/srmodels/srmodels.bin"
+          test -s "$BUILD/srmodels/wn9_hiesp/wn9_index"
+          test -s "$BUILD/srmodels/wn9_hiesp/wn9_data"
+          test -d "$BUILD/srmodels/nsnet2"
+          test -n "$(find "$BUILD/srmodels/nsnet2" -type f -print -quit)"
+          echo "========================================"
+          echo "COMPATIBILITY GATE: PASS"
+          echo "ESP32-S3 + 16MB Flash + 8MB OPI PSRAM"
+          echo "ESP-IDF 6.0.1 + ESP-SR 2.4.5"
+          echo "WakeNet9 Hi ESP + NSNet2"
+          echo "CA bundle + embedded TLS trust store"
+          echo "Model partition: 4MiB"
+          echo "========================================"
+
+      - name: Upload firmware and ESP-SR model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32S3-Firmware-Full
+          if-no-files-found: error
+          path: |
+            .pio/build/esp32-s3-devkitc-1/firmware.bin
+            .pio/build/esp32-s3-devkitc-1/bootloader.bin
+            .pio/build/esp32-s3-devkitc-1/partitions.bin
+            .pio/build/esp32-s3-devkitc-1/firmware.elf
+            .pio/build/esp32-s3-devkitc-1/srmodels/srmodels.bin
