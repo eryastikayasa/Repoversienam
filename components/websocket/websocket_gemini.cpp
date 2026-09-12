@@ -95,9 +95,7 @@ static bool send_greeting_text(void)
         "{\"clientContent\":{\"turns\":[{\"role\":\"user\",\"parts\":[{\"text\":\""
         "Mulai percakapan dengan mengucapkan tepat: Halo, ada yang bisa dibantu?"
         "\"}]}],\"turnComplete\":true}}";
-    const int n = (int)(sizeof(msg) - 1);
-    const int sent = esp_websocket_client_send_text(s_client, msg, n, pdMS_TO_TICKS(1000));
-    if (sent != n) return false;
+    if (!websocket_gemini_send_text(s_client, msg)) return false;
     s_greeting_sent = true;
     s_greeting_finished = false;
     ESP_LOGI(TAG, "WS_GEMINI: Greeting JSON sent");
