@@ -18,14 +18,14 @@ static const esp_wn_iface_t *s_iface = nullptr;
 static model_iface_data_t *s_model = nullptr;
 static int s_chunk_samples = 0;
 static bool s_ready = false;
-static volatile bool s_detected = false;
+static volatile bool s_armed = false;
 static wakeword_detected_cb_t s_callback = nullptr;
 static void *s_callback_ctx = nullptr;
 
 static void wakeword_audio_cb(const uint8_t *pcm, size_t len, void *ctx)
 {
     (void)ctx;
-    if (!s_ready || !s_iface || !s_model || s_chunk_samples <= 0 || !pcm || len < 2)
+    if (!s_ready || !s_armed || !s_iface || !s_model || s_chunk_samples <= 0 || !pcm || len < 2)
         return;
 
     static int16_t buffer[WAKE_BUFFER_SAMPLES];
@@ -42,10 +42,10 @@ static void wakeword_audio_cb(const uint8_t *pcm, size_t len, void *ctx)
     memcpy(buffer + samples, src, incoming * sizeof(int16_t));
     samples += incoming;
 
-    while (samples >= static_cast<size_t>(s_chunk_samples) && !s_detected) {
+    while (samples >= static_cast<size_t>(s_chunk_samples) && s_armed) {
         const int result = s_iface->detect(s_model, buffer);
         if (result > 0) {
-            s_detected = true;
+            s_armed = false;
             samples = 0;
             ESP_LOGW(TAG, "WAKE WORD TERDETEKSI: HI, ESP (id=%d)", result);
             if (s_callback) s_callback(s_callback_ctx);
@@ -117,7 +117,8 @@ bool wakeword_init(void)
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
+    s_armed = false;
+    ESP_LOGI(TAG, "WakeNet siap: HI, ESP");
     return true;
 }
 
@@ -126,11 +127,23 @@ bool wakeword_start(wakeword_detected_cb_t cb, void *ctx)
     if (!s_ready) return false;
     s_callback = cb;
     s_callback_ctx = ctx;
-    s_detected = false;
+    return wakeword_rearm();
+}
+
+bool wakeword_rearm(void)
+{
+    if (!s_ready) return false;
+    s_armed = true;
+    ESP_LOGI(TAG, "Wake word ARMED: HI, ESP");
     return audio_engine_set_mic_listener(wakeword_audio_cb, nullptr);
 }
 
 bool wakeword_is_ready(void)
 {
     return s_ready;
+}
+
+bool wakeword_is_armed(void)
+{
+    return s_ready && s_armed;
 }
