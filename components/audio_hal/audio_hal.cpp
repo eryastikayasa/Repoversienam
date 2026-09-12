@@ -73,8 +73,7 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
     const size_t available_end = write_pos > delay_samples ? write_pos - delay_samples : 0;
     if (available_end > aec_ref_last_target_end) {
         const size_t target_end = available_end; const size_t start = target_end >= samples ? target_end - samples : 0;
-        const size_t oldest = write_pos > AEC_REF_RING_SAMPLES ? write_pos - AEC_REF_RING_SAMPLES : 0;
-        const size_t safe_start = start < oldest ? oldest : start; const size_t available = target_end > safe_start ? target_end - safe_start : 0;
+        const size_t oldest = write_pos > AEC_REF_RING_SAMPLES ? write_pos - AEC_REF_RING_SAMPLES : 0; const size_t available = target_end > (start < oldest ? oldest : start) ? target_end - (start < oldest ? oldest : start) : 0;
         const size_t copy_samples = available > samples ? samples : available;
         if (copy_samples > 0) { const size_t src_start = target_end - copy_samples; for (size_t i = 0; i < copy_samples; ++i) dest[samples - copy_samples + i] = aec_ref_ring[(src_start + i) % AEC_REF_RING_SAMPLES]; }
         aec_ref_last_target_end = target_end;
@@ -128,3 +127,24 @@ void audio_hal_init(void)
 void audio_hal_ns_init(void)
 {
     if (ns_ready) return; ns_models = esp_srmodel_init("model"); if (!ns_models) { ESP_LOGE(TAG, "ESP-SR NSNet2 init gagal: model partition tidak tersedia"); return; } char *model_name = esp_srmodel_filter(ns_models, ESP_NSNET_PREFIX, NULL); if (!model_name) { ESP_LOGE(TAG, "ESP-SR NSNet model tidak ditemukan di srmodels.bin"); return; } ns_iface = esp_nsnet_handle_from_name(model_name); if (!ns_iface) { ESP_LOGE(TAG, "ESP-SR NSNet handle tidak ditemukan: %s", model_name); return; } ns_data = ns_iface->create(model_name); if (!ns_data) { ESP_LOGE(TAG, "ESP-SR NSNet create gagal: %s", model_name); ns_iface = nullptr; return; } int chunk = ns_iface->get_samp_chunksize(ns_data); if (chunk != (int)AEC_FRAME_SAMPLES) { ESP_LOGE(TAG, "ESP-SR NSNet frame tidak cocok: chunk=%d expected=%u", chunk, (unsigned)AEC_FRAME_SAMPLES); ns_iface->destroy(ns_data); ns_data = nullptr; ns_iface = nullptr; return; } ns_ready = true; log_audio_heap("after_nsnet2_init"); ESP_LOGI(TAG, "ESP-SR NSNet2 READY: model=%s frame=%d rate=%dHz", model_name, chunk, MIC_SAMPLE_RATE);
+}
+size_t audio_read_mic(uint8_t *dest, size_t max_len)
+{
+    if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0; if (!ns_ready) audio_hal_ns_init(); static int32_t raw[512]; static int16_t mic_frame[AEC_FRAME_SAMPLES]; static int16_t ref_frame[AEC_FRAME_SAMPLES]; static int16_t clean_frame[AEC_FRAME_SAMPLES]; static int16_t ns_frame[AEC_FRAME_SAMPLES];
+    size_t max_samples = max_len / sizeof(int16_t); if (max_samples > 512) max_samples = 512; size_t bytes_read = 0; if (i2s_channel_read(rx_handle, raw, max_samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) return 0; size_t samples = bytes_read / sizeof(int32_t); int16_t *pcm = reinterpret_cast<int16_t *>(dest); for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
+    if (aec_ready && samples == AEC_FRAME_SAMPLES) { memcpy(mic_frame, pcm, sizeof(mic_frame)); aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES); aec_process(aec_handle, mic_frame, ref_frame, clean_frame); aec_log_frame_levels(mic_frame, ref_frame, clean_frame, AEC_FRAME_SAMPLES); aec_log_alignment_and_adapt(mic_frame, ref_frame, AEC_FRAME_SAMPLES); memcpy(pcm, clean_frame, sizeof(clean_frame)); }
+    if (ns_ready && samples == AEC_FRAME_SAMPLES) { ns_iface->process(ns_data, pcm, ns_frame); memcpy(pcm, ns_frame, sizeof(ns_frame)); }
+    constexpr int MIC_OUTPUT_GAIN = 2; for (size_t i = 0; i < samples; ++i) { int32_t value = (int32_t)pcm[i] * MIC_OUTPUT_GAIN; if (value > INT16_MAX) value = INT16_MAX; if (value < INT16_MIN) value = INT16_MIN; pcm[i] = (int16_t)value; }
+    return samples * sizeof(int16_t);
+}
+size_t audio_write_speaker(const uint8_t *src, size_t len)
+{
+    if (!tx_handle || !src || len < 2) return 0; len &= ~((size_t)1); static int32_t tx_buffer[1024]; static int16_t ref_pcm[240]; const int16_t *pcm = reinterpret_cast<const int16_t *>(src); const size_t total = len / sizeof(int16_t); size_t offset = 0; constexpr size_t I2S_WRITE_SAMPLES = 240; constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
+    while (offset < total) { const size_t old_offset = offset; size_t n = total - offset; if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES; for (size_t i = 0; i < n; ++i) tx_buffer[i] = static_cast<int32_t>(pcm[old_offset + i]) << 16; size_t written = 0; esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS); size_t samples_written = written / sizeof(int32_t); if (samples_written > n) samples_written = n; if (samples_written > 0) { offset += samples_written; memcpy(ref_pcm, pcm + old_offset, samples_written * sizeof(int16_t)); aec_ref_push_24k(ref_pcm, samples_written); } if (err != ESP_OK || samples_written != n) { if (err != ESP_OK || samples_written == 0) { ESP_LOGW(TAG, "I2S speaker write fail: err=%s written=%u/%u", esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t))); vTaskDelay(1); return offset * sizeof(int16_t); } continue; } }
+    return offset * sizeof(int16_t);
+}
+void audio_i2s_test_tone(void)
+{
+    static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -8000, -7727, -6928, -5657, -4000, -2071};
+    static int16_t tone[2400]; if (!tx_handle) return; for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24]; ESP_LOGI(TAG, "I2S TEST TONE: 1kHz PCM16 -> PCM32 I2S, 24kHz, 100ms"); audio_write_speaker(reinterpret_cast<const uint8_t *>(tone), sizeof(tone));
+}
