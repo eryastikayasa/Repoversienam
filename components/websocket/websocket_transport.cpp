@@ -25,10 +25,8 @@ static bool build_server_url(char *url, size_t url_size)
         ESP_LOGE(TAG, "Gemini API key tidak tersedia/valid");
         return false;
     }
-    const int written = snprintf(
-        url, url_size,
-        "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=%s",
-        api_key);
+    const int written = snprintf(url, url_size,
+        "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=%s", api_key);
     memset(api_key, 0, sizeof(api_key));
     return written > 0 && (size_t)written < url_size;
 }
@@ -36,9 +34,7 @@ static bool build_server_url(char *url, size_t url_size)
 esp_err_t websocket_transport_init(void)
 {
     if (s_initialized) return ESP_OK;
-    s_client = nullptr;
-    s_connected = false;
-    s_initialized = true;
+    s_client = nullptr; s_connected = false; s_initialized = true;
     ESP_LOGI(TAG, "Transport WebSocket siap");
     return ESP_OK;
 }
@@ -50,18 +46,14 @@ esp_err_t websocket_transport_connect(void)
         if (err != ESP_OK) return err;
     }
     if (s_client && esp_websocket_client_is_connected(s_client)) {
-        s_connected = true;
-        return ESP_OK;
+        s_connected = true; return ESP_OK;
     }
     if (s_client) {
         (void)esp_websocket_client_destroy(s_client);
-        s_client = nullptr;
-        s_connected = false;
+        s_client = nullptr; s_connected = false;
     }
-
     char url[URL_MAX] = {0};
     if (!build_server_url(url, sizeof(url))) return ESP_ERR_INVALID_ARG;
-
     esp_websocket_client_config_t cfg = {};
     cfg.uri = url;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -69,24 +61,18 @@ esp_err_t websocket_transport_connect(void)
     cfg.reconnect_timeout_ms = 5000;
     cfg.disable_auto_reconnect = true;
     cfg.task_stack = 4096;
-
+    cfg.buffer_size = 8192;
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) {
-        ESP_LOGE(TAG, "esp_websocket_client_init gagal");
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "esp_websocket_client_init gagal"); return ESP_FAIL;
     }
-    esp_err_t err = esp_websocket_register_events(
-        s_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, nullptr);
+    esp_err_t err = esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, nullptr);
     if (err != ESP_OK) {
-        (void)esp_websocket_client_destroy(s_client);
-        s_client = nullptr;
-        return err;
+        (void)esp_websocket_client_destroy(s_client); s_client = nullptr; return err;
     }
     err = esp_websocket_client_start(s_client);
     if (err != ESP_OK) {
-        (void)esp_websocket_client_destroy(s_client);
-        s_client = nullptr;
-        return err;
+        (void)esp_websocket_client_destroy(s_client); s_client = nullptr; return err;
     }
     return ESP_OK;
 }
@@ -103,31 +89,20 @@ bool websocket_transport_is_connected(void)
     return s_client && s_connected && esp_websocket_client_is_connected(s_client);
 }
 
-esp_websocket_client_handle_t websocket_transport_client(void)
-{
-    return s_client;
-}
-
-uint32_t websocket_transport_generation(void)
-{
-    return s_generation;
-}
+esp_websocket_client_handle_t websocket_transport_client(void) { return s_client; }
+uint32_t websocket_transport_generation(void) { return s_generation; }
 
 esp_err_t websocket_transport_send_text(const char *text, size_t len)
 {
-    if (!text || len == 0) return ESP_ERR_INVALID_ARG;
+    if (!text || len == 0 || len > 8192) return ESP_ERR_INVALID_ARG;
     if (!websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
-    const int sent = esp_websocket_client_send_text(
-        s_client, text, (int)len, pdMS_TO_TICKS(2000));
+    const int sent = esp_websocket_client_send_text(s_client, text, (int)len, pdMS_TO_TICKS(2000));
     return sent == (int)len ? ESP_OK : ESP_FAIL;
 }
 
-/* Called only by websocket_event.cpp. Keeping connection state here prevents
- * the event module from becoming a second transport implementation. */
 void websocket_transport_event_connected(void)
 {
-    s_connected = true;
-    ++s_generation;
+    s_connected = true; ++s_generation;
     ESP_LOGI(TAG, "WebSocket CONNECTED generation=%lu", (unsigned long)s_generation);
 }
 
