@@ -23,9 +23,33 @@ static void on_wakeword_detected(void *ctx)
     s_assistant_requested = true;
 }
 
+static void log_main_task_audit(const char *stage)
+{
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    TaskHandle_t task = xTaskGetCurrentTaskHandle();
+
+    ESP_LOGI(TAG,
+             "TASK AUDIT main_task stage=%s stack=? watermark=%uB priority=%u core=%d",
+             stage ? stage : "unknown",
+             (unsigned)(uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t)),
+             (unsigned)uxTaskPriorityGet(task),
+             (int)xTaskGetCoreID(task));
+    ESP_LOGI(TAG,
+             "RAM AUDIT[%s] internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u",
+             stage ? stage : "unknown",
+             (unsigned)internal_free,
+             (unsigned)internal_largest,
+             (unsigned)psram_free,
+             (unsigned)psram_largest);
+}
+
 extern "C" void app_startup_run(void)
 {
     ESP_LOGI(TAG, "Repo6 startup: app_startup_run()");
+    log_main_task_audit("boot");
 
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -55,6 +79,7 @@ extern "C" void app_startup_run(void)
     if (!wifi_wait_for_connection(30000)) return;
     esp_wifi_set_ps(WIFI_PS_NONE);
     audio_engine_log_diagnostics("wifi_ready");
+    log_main_task_audit("wifi_ready");
 
     if (!wakeword_init()) return;
     if (!wakeword_start(on_wakeword_detected, nullptr)) return;
@@ -63,6 +88,7 @@ extern "C" void app_startup_run(void)
     ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi -> Wake Word");
     ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
     audio_engine_log_diagnostics("wakeword_ready");
+    log_main_task_audit("wakeword_ready");
 
     for (;;) {
         if (s_assistant_requested && !websocket_is_connected()) {
