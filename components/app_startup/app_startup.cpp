@@ -1,5 +1,4 @@
 #include "app_startup.h"
-
 #include "audio_hal.h"
 #include "audio_engine.h"
 #include "display_engine.h"
@@ -8,7 +7,6 @@
 #include "wifi_manager.h"
 #include "websocket.h"
 #include "wakeword.h"
-
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
@@ -31,7 +29,6 @@ extern "C" void app_startup_run(void)
 
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS perlu erase/init ulang");
         if (nvs_flash_erase() == ESP_OK) nvs_err = nvs_flash_init();
     }
     if (nvs_err != ESP_OK) {
@@ -44,78 +41,57 @@ extern "C" void app_startup_run(void)
     uart_control_init();
 
     if (web_config_is_needed()) {
-        ESP_LOGW(TAG, "Konfigurasi belum lengkap -> masuk Web Config");
+        ESP_LOGW(TAG, "Konfigurasi belum lengkap -> Web Config");
         web_config_start();
         for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     audio_hal_init();
     audio_hal_ns_init();
-    if (!audio_engine_init()) {
-        ESP_LOGE(TAG, "Audio Engine init gagal");
-        return;
-    }
+    if (!audio_engine_init()) return;
 
     wifi_init_sta();
-    if (!wifi_wait_for_connection(30000)) {
-        ESP_LOGE(TAG, "Wi-Fi belum READY -> startup dihentikan");
-        return;
-    }
+    if (!wifi_wait_for_connection(30000)) return;
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    if (!wakeword_init()) {
-        ESP_LOGE(TAG, "WakeNet init gagal -> startup dihentikan");
-        return;
-    }
-    if (!wakeword_start(on_wakeword_detected, nullptr)) {
-        ESP_LOGE(TAG, "WakeNet listener gagal dipasang");
-        return;
-    }
-
-    if (!audio_engine_start_capture()) {
-        ESP_LOGE(TAG, "Audio Engine capture init gagal");
-        return;
-    }
+    if (!wakeword_init()) return;
+    if (!wakeword_start(on_wakeword_detected, nullptr)) return;
+    if (!audio_engine_start_capture()) return;
 
     ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi -> Wake Word");
     ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
-    ESP_LOGI(TAG, "Menunggu Wake Word sebelum membuka sesi Gemini...");
 
     for (;;) {
         if (s_assistant_requested && !websocket_is_connected()) {
             s_assistant_requested = false;
-            ESP_LOGI(TAG, "Wake Word diterima -> buka sesi Gemini");
+            ESP_LOGI(TAG, "Wake Word -> buka sesi Gemini");
             websocket_init();
             if (!websocket_connect()) {
-                ESP_LOGE(TAG, "WebSocket Gemini gagal start");
+                ESP_LOGW(TAG, "WebSocket Gemini gagal -> Wake Word");
                 (void)wakeword_rearm();
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
-            ESP_LOGI(TAG, "WebSocket connected; menunggu setupComplete sebelum MIC streaming");
         }
 
-        if (!websocket_is_connected() && websocket_should_resume()) {
-            ESP_LOGW(TAG, "Gemini GoAway -> reconnect menggunakan session resumption");
-            if (websocket_connect()) {
-                s_session_was_connected = true;
-                ESP_LOGI(TAG, "Gemini session resumed; waiting for setupComplete");
-            } else {
-                ESP_LOGW(TAG, "Gemini session resume gagal -> kembali ke Wake Word");
-                (void)wakeword_rearm();
+        if (!websocket_is_connected() && websocket_take_resume_request()) {
+            ESP_LOGW(TAG, "Gemini GoAway: mencoba session resumption (timeLeft=%llums)",
+                     (unsigned long long)websocket_goaway_time_left_ms());
+            if (!websocket_connect()) {
+                ESP_LOGW(TAG, "Session resumption gagal -> Wake Word");
                 s_session_was_connected = false;
+                s_assistant_requested = false;
+                (void)wakeword_rearm();
             }
         }
 
         const bool connected = websocket_is_connected();
-        if (connected) {
-            if (!s_session_was_connected) {
-                s_session_was_connected = true;
-                ESP_LOGI(TAG, "PIPELINE READY:");
-                ESP_LOGI(TAG, "MIC -> Audio HAL -> Audio Engine -> WebSocket -> Gemini");
-                ESP_LOGI(TAG, "Gemini -> WebSocket -> Audio Engine -> Audio HAL -> SPEAKER");
-            }
-        } else if (s_session_was_connected && !websocket_should_resume()) {
+        if (connected && !s_session_was_connected) {
+            s_session_was_connected = true;
+            ESP_LOGI(TAG, "PIPELINE READY:");
+            ESP_LOGI(TAG, "MIC -> Audio HAL -> Audio Engine -> WebSocket -> Gemini");
+            ESP_LOGI(TAG, "Gemini -> WebSocket -> Audio Engine -> Audio HAL -> SPEAKER");
+        } else if (!connected && s_session_was_connected) {
             s_session_was_connected = false;
             s_assistant_requested = false;
             ESP_LOGI(TAG, "Sesi Gemini selesai -> kembali menunggu Wake Word");
