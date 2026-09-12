@@ -1,196 +1,280 @@
 # RepoVersiEnam
 
-## Konsep Arsitektur Audio + WebSocket
+# Arsitektur Audio + WebSocket
 
-RepoVersiEnam menggunakan arsitektur modular dengan tujuan utama: **mudah diperbaiki, mudah diuji, dan tidak membuat WebSocket menjadi pusat seluruh sistem audio**.
+RepoVersiEnam dirancang dengan satu tujuan utama: **mudah diperbaiki, mudah diuji, dan mudah dikembangkan tanpa merusak modul lain**.
 
-Referensi dasar arsitektur berasal dari RepoVersiEmpat, tetapi alur audio di RepoVersiEnam ditegaskan dengan pemisahan tanggung jawab yang lebih jelas.
+Dokumen ini menjadi **kontrak arsitektur** sebelum implementasi WebSocket dan integrasi Gemini dilanjutkan.
 
-## Alur Utama
+---
+
+## 1. Alur Utama
 
 ```text
 MIC
-  │
-  ▼
-AUDIO HAL
-  │  PCM audio
-  ▼
-AUDIO ENGINE
-  │
-  │  audio TX
-  ▼
-WEBSOCKET
-  │
-  │  transport
-  ▼
-GEMINI
-  │
-  │  audio/data RX
-  ▼
-WEBSOCKET
-  │
-  ▼
-AUDIO ENGINE
-  │
-  │  PCM audio
-  ▼
-AUDIO HAL
-  │
-  ▼
-SPEAKER
+ │
+ ▼
+┌──────────────┐
+│  AUDIO HAL   │  Hardware audio
+└──────┬───────┘
+       │ PCM
+       ▼
+┌──────────────┐
+│ AUDIO ENGINE │  Pusat pipeline audio
+└──────┬───────┘
+       │ TX audio
+       ▼
+┌────────────────────┐
+│     WEBSOCKET      │  Kurir / transport
+└──────────┬─────────┘
+           │
+           ▼
+        GEMINI
+           │
+           ▼
+┌────────────────────┐
+│     WEBSOCKET      │  Kurir / transport
+└──────────┬─────────┘
+           │ RX audio
+           ▼
+┌──────────────┐
+│ AUDIO ENGINE │
+└──────┬───────┘
+       │ PCM
+       ▼
+┌──────────────┐
+│  AUDIO HAL   │
+└──────┬───────┘
+       ▼
+    SPEAKER
 ```
 
-### Prinsip utama
+**WebSocket hanya kurir. Audio Engine adalah pusat audio. Audio HAL adalah hardware layer.**
 
-> **Audio Engine adalah pusat pengelolaan audio. WebSocket hanya kurir. Audio HAL hanya menangani hardware audio.**
+---
 
-## Pembagian Tanggung Jawab
+## 2. Struktur Repository Target
 
-### 1. Audio HAL — Hardware Audio
+```text
+RepoVersiEnam/
+│
+├── main/
+│   ├── main.cpp                 ← KOSONG
+│   └── CMakeLists.txt
+│
+├── components/
+│   │
+│   ├── audio_hal/
+│   │   ├── include/
+│   │   │   └── audio_hal.h
+│   │   └── audio_hal.cpp
+│   │
+│   ├── audio_engine/
+│   │   ├── include/
+│   │   │   └── audio_engine.h
+│   │   ├── audio_engine.cpp
+│   │   ├── audio_engine_mic.cpp
+│   │   └── audio_engine_ingest.cpp
+│   │
+│   ├── websocket/
+│   │   ├── include/
+│   │   │   └── websocket.h
+│   │   ├── websocket.cpp
+│   │   └── websocket_gemini.cpp
+│   │
+│   ├── wifi_manager/
+│   │   ├── include/
+│   │   │   └── wifi_manager.h
+│   │   └── wifi_manager.cpp
+│   │
+│   ├── uart_control/
+│   │   ├── include/
+│   │   │   └── uart_control.h
+│   │   └── uart_control.cpp
+│   │
+│   ├── web_config/
+│   │   ├── include/
+│   │   │   └── web_config.h
+│   │   └── web_config.cpp
+│   │
+│   └── display/
+│       ├── display_driver/
+│       ├── display_engine/
+│       ├── display_face/
+│       └── display_text/
+│
+├── partitions/
+│   └── partitions.csv
+│
+├── platformio.ini
+├── CMakeLists.txt
+└── README.md
+```
 
-Audio HAL hanya bertanggung jawab terhadap hardware audio, terutama:
+Struktur boleh bertambah jika kebutuhan teknis memerlukannya, tetapi **batas tanggung jawab modul tidak boleh kabur**.
+
+---
+
+## 3. Tanggung Jawab Setiap Layer
+
+### Audio HAL
+
+Audio HAL hanya menangani hardware audio:
 
 - microphone
 - speaker
 - I2S
-- konfigurasi sample rate
-- pembacaan audio dari microphone
-- pengiriman audio ke speaker
-- konversi format yang memang diperlukan oleh hardware
+- DMA/I2S configuration
+- sample rate hardware
+- membaca microphone
+- menulis speaker
+- konversi format yang diperlukan hardware
 
-Audio HAL **tidak mengetahui detail Gemini atau protokol WebSocket**.
+Audio HAL **tidak mengetahui Gemini dan WebSocket**.
 
 ```text
 MIC ──► Audio HAL ──► Audio Engine
 Audio Engine ──► Audio HAL ──► SPEAKER
 ```
 
-### 2. Audio Engine — Pusat Audio
+### Audio Engine
 
-Audio Engine menjadi penghubung utama antara hardware audio dan jaringan.
+Audio Engine adalah **otak pipeline audio**.
 
 Tanggung jawab:
 
 - menerima audio dari Audio HAL
 - mengelola buffer audio
-- mengelola TX audio
-- menerima audio RX dari WebSocket
-- menyiapkan audio untuk speaker
-- melakukan pemrosesan audio yang diperlukan
-- mengatur aliran audio TX/RX
+- TX queue/buffer
+- RX queue/buffer
+- pemrosesan audio
+- mengatur playback
+- menerima audio dari jaringan melalui API WebSocket
+- mengirim audio ke jaringan melalui API WebSocket
+- menjaga state audio
 
-Audio Engine **tidak mengetahui detail koneksi TCP/TLS/WebSocket**.
+Audio Engine **tidak mengetahui detail TCP/TLS/WebSocket/Gemini JSON**.
 
-```text
-Audio HAL
-    │
-    ▼
-Audio Engine
-    │
-    ├── TX ──► WebSocket
-    │
-    └── RX ◄── WebSocket
-```
+### WebSocket
 
-### 3. WebSocket — Transport / Kurir
+WebSocket adalah **kurir**.
 
-WebSocket sengaja dibuat tipis.
-
-Tanggung jawab WebSocket hanya:
+Tanggung jawab:
 
 - membuat koneksi
-- memutus koneksi
+- disconnect
 - reconnect
-- mengirim data
-- menerima data
-- menangani event koneksi
-- menangani transport WebSocket
-- menangani kebutuhan protokol Gemini yang memang khusus pada layer komunikasi
+- mengirim payload
+- menerima payload
+- event koneksi
+- status koneksi
+- transport WebSocket
 
 WebSocket **tidak boleh**:
 
 - membaca microphone secara langsung
 - menulis speaker secara langsung
-- mengakses I2S audio secara langsung
-- mengelola audio buffer milik Audio Engine
+- mengakses I2S secara langsung
+- memiliki buffer audio utama
 - melakukan audio processing
-- membuat alur audio sendiri
+- mengatur playback
+- mengatur microphone
 - mengambil alih lifecycle Audio Engine
 
-Dengan demikian jika koneksi Gemini atau format protokol berubah, perubahan utama cukup berada di layer WebSocket tanpa membongkar Audio HAL.
+---
 
-## Interface Antar-Modul
+## 4. Struktur Internal WebSocket
 
-Hubungan modul dibuat satu arah dan sederhana:
-
-```text
-                 SEND AUDIO
-Audio Engine ─────────────────► WebSocket
-
-                 RECEIVE AUDIO
-Audio Engine ◄───────────────── WebSocket
-```
-
-WebSocket tidak memanggil Audio HAL secara langsung.
-
-Untuk data masuk, WebSocket meneruskan data ke Audio Engine melalui callback/event/queue yang disepakati.
+WebSocket sengaja dipisah menjadi transport dan adapter Gemini.
 
 ```text
-Gemini
-  │
-  ▼
-WebSocket
-  │
-  │ RX event / callback / queue
-  ▼
-Audio Engine
-  │
-  ▼
-Audio HAL
-  │
-  ▼
-Speaker
+components/websocket/
+│
+├── include/
+│   └── websocket.h
+│
+├── websocket.cpp
+│   │
+│   ├── init
+│   ├── connect
+│   ├── disconnect
+│   ├── send
+│   ├── receive event
+│   ├── connection state
+│   └── reconnect
+│
+└── websocket_gemini.cpp
+    │
+    ├── Gemini session
+    ├── Gemini message
+    ├── Gemini JSON
+    ├── Gemini audio packet
+    └── Gemini protocol adapter
 ```
 
-## Struktur Komponen yang Direncanakan
+Tujuannya:
 
 ```text
-components/
-│
-├── audio_hal/
-│   ├── include/
-│   │   └── audio_hal.h
-│   └── audio_hal.cpp
-│
-├── audio_engine/
-│   ├── include/
-│   │   └── audio_engine.h
-│   ├── audio_engine.cpp
-│   ├── audio_engine_mic.cpp
-│   └── audio_engine_ingest.cpp
-│
-├── websocket/
-│   ├── include/
-│   │   └── websocket.h
-│   ├── websocket.cpp
-│   └── websocket_gemini.cpp
-│
-├── wifi_manager/
-├── uart_control/
-├── web_config/
-└── display/
+Transport berubah
+    → perbaiki websocket.cpp
+
+Format Gemini berubah
+    → perbaiki websocket_gemini.cpp
+
+Audio pipeline berubah
+    → perbaiki audio_engine
+
+Hardware audio berubah
+    → perbaiki audio_hal
 ```
 
-Struktur tersebut dapat berkembang jika implementasi membutuhkan pemisahan tambahan, tetapi batas tanggung jawab tetap dipertahankan.
+Jangan membuat satu file WebSocket raksasa yang menangani semuanya.
 
-## API WebSocket yang Sederhana
+---
 
-Interface awal WebSocket ditujukan sesederhana mungkin:
+## 5. Dependency Antar-Modul
+
+Arah dependency yang diinginkan:
+
+```text
+                    ┌──────────────┐
+                    │  AUDIO HAL   │
+                    └──────▲───────┘
+                           │
+                           │ audio API
+                           │
+                    ┌──────┴───────┐
+                    │ AUDIO ENGINE │
+                    └──────▲───────┘
+                           │
+                           │ websocket API
+                           │
+                    ┌──────┴───────┐
+                    │  WEBSOCKET   │
+                    └──────────────┘
+```
+
+Yang **tidak boleh**:
+
+```text
+WebSocket ─────► Audio HAL
+WebSocket ─────► I2S
+WebSocket ─────► Speaker
+WebSocket ─────► Microphone
+```
+
+WebSocket berkomunikasi dengan Audio Engine melalui API yang kecil dan stabil.
+
+---
+
+## 6. Kontrak API WebSocket
+
+API publik awal dibuat sesederhana mungkin:
 
 ```cpp
-void websocket_init();
+void websocket_init(void);
 
-bool websocket_connect();
+bool websocket_connect(void);
 
 bool websocket_send_audio(
     const uint8_t *data,
@@ -201,150 +285,179 @@ bool websocket_send_text(
     const char *text
 );
 
-void websocket_disconnect();
+void websocket_disconnect(void);
 
-bool websocket_is_connected();
+bool websocket_is_connected(void);
 ```
 
-Untuk data masuk, WebSocket menyediakan mekanisme callback/event/queue menuju Audio Engine.
-
-Contoh konsep:
-
-```cpp
-websocket_set_audio_callback(...);
-websocket_set_event_callback(...);
-```
-
-Implementasi final API dapat disesuaikan setelah kontrak data Gemini ditetapkan.
-
-## Aturan Dependency
-
-Dependency utama harus mengikuti arah berikut:
+Untuk data masuk, gunakan salah satu mekanisme yang ditentukan saat implementasi:
 
 ```text
-Audio HAL
-    ▲
-    │
-Audio Engine
-    ▲
-    │
 WebSocket
+    │
+    ├── callback
+    │
+    ├── event
+    │
+    └── queue
+          │
+          ▼
+     Audio Engine
 ```
 
-Secara konsep, WebSocket tidak boleh bergantung langsung kepada Audio HAL.
+Pilihan final callback/event/queue akan ditentukan berdasarkan kebutuhan concurrency dan ownership buffer. **Tidak boleh membuat API yang mengikat WebSocket langsung ke Audio HAL.**
 
-Lebih baik:
+---
 
-```text
-WebSocket ──► Audio Engine
-```
+## 7. TX Pipeline
 
-daripada:
-
-```text
-WebSocket ──► Audio HAL
-```
-
-Hal ini membuat WebSocket dapat diganti, diperbaiki, atau diuji tanpa mengubah driver audio.
-
-## TX dan RX Dipisahkan
-
-### TX — Microphone ke Gemini
+Microphone menuju Gemini:
 
 ```text
 MIC
- ↓
+ │
+ ▼
 Audio HAL
- ↓
+ │
+ ▼
 Audio Engine
- ↓
-TX Queue / Buffer
- ↓
+ │
+ ├── capture
+ ├── processing
+ ├── TX buffer
+ └── TX queue
+ │
+ ▼
 WebSocket
- ↓
+ │
+ ▼
 Gemini
 ```
 
-### RX — Gemini ke Speaker
+Audio Engine adalah pemilik buffer TX.
+
+WebSocket hanya mengirim data yang diberikan kepadanya.
+
+---
+
+## 8. RX Pipeline
+
+Gemini menuju speaker:
 
 ```text
 Gemini
- ↓
+ │
+ ▼
 WebSocket
- ↓
-RX Queue / Buffer
- ↓
+ │
+ ├── receive
+ └── validate/route protocol payload
+ │
+ ▼
 Audio Engine
- ↓
+ │
+ ├── RX queue
+ ├── RX buffer
+ ├── audio processing
+ └── playback scheduling
+ │
+ ▼
 Audio HAL
- ↓
-Speaker
+ │
+ ▼
+SPEAKER
 ```
 
-TX dan RX tidak boleh dicampur menjadi satu fungsi besar.
+WebSocket tidak boleh melewati Audio Engine untuk langsung menulis speaker.
 
-## Queue dan Buffer
+---
 
-Queue/buffer menjadi tanggung jawab Audio Engine untuk aliran audio.
+## 9. Ownership Buffer
 
-Konsep:
+Aturan ownership harus jelas.
 
 ```text
-                 ┌───────────────┐
-MIC ─► Audio HAL │               │
-                 │  Audio Engine │ ──► TX Queue ──► WebSocket
-                 │               │
-Speaker ◄ Audio HAL ◄ RX Queue ◄─│ ◄────────────── WebSocket
-                 └───────────────┘
+Audio Engine
+│
+├── TX buffer  ← milik Audio Engine
+├── TX queue   ← milik Audio Engine
+├── RX buffer  ← milik Audio Engine
+└── RX queue   ← milik Audio Engine
+
+WebSocket
+└── transport buffer sementara saja
 ```
 
-WebSocket tidak memiliki hak kepemilikan atas buffer audio utama.
+WebSocket tidak boleh mengambil alih ownership buffer audio utama.
 
-## Error Handling
+Ini penting supaya tidak terjadi:
 
-Error dipisahkan berdasarkan layer.
+- double free
+- use-after-free
+- buffer overwrite
+- race condition
+- memory leak
 
-### Audio HAL
+---
 
-Contoh:
+## 10. TX dan RX Harus Terpisah
+
+Jangan membuat satu fungsi besar seperti:
+
+```cpp
+websocket_handle_audio_everything();
+```
+
+Sebaliknya:
 
 ```text
-I2S error
-MIC error
-SPEAKER error
-DMA error
+TX:
+Audio Engine → WebSocket → Gemini
+
+RX:
+Gemini → WebSocket → Audio Engine
 ```
 
-### Audio Engine
+Keduanya memiliki buffer, counter, error, dan flow-control masing-masing.
 
-Contoh:
+---
+
+## 11. State WebSocket
+
+State koneksi tidak boleh dicampur dengan state audio.
 
 ```text
-TX buffer penuh
-RX buffer penuh
-Audio underrun
-Audio overflow
+DISCONNECTED
+      │
+      ▼
+ CONNECTING
+      │
+      ▼
+ CONNECTED
+      │
+      ├───────────────┐
+      ▼               │
+    ERROR             │
+      │               │
+      ▼               │
+  BACKOFF ────────────┘
 ```
 
-### WebSocket
-
-Contoh:
+Audio Engine cukup menerima informasi:
 
 ```text
-DNS error
-TLS error
-Connection failed
-Connection closed
-Send failed
-Receive failed
-Protocol error
+CONNECTED
+DISCONNECTED
+ERROR
 ```
 
-Error WebSocket tidak boleh langsung mengendalikan hardware speaker atau microphone.
+Audio Engine menentukan sendiri apa yang harus dilakukan terhadap pipeline audio.
 
-## Reconnect
+---
 
-Reconnect menjadi tanggung jawab WebSocket.
+## 12. Reconnect
+
+Reconnect adalah tanggung jawab WebSocket.
 
 ```text
 Connection Lost
@@ -352,182 +465,235 @@ Connection Lost
       ▼
 WebSocket
       │
-      ├── cleanup transport
-      ├── delay/backoff
-      └── reconnect
-              │
-              ▼
-         Connection OK
+      ├── close/cleanup transport
+      ├── backoff
+      ├── reconnect
+      └── connection event
+                │
+                ▼
+          Audio Engine
 ```
 
-Audio Engine cukup menerima status koneksi melalui event.
+WebSocket tidak boleh saat reconnect langsung mematikan atau menginisialisasi ulang I2S.
 
-## State Koneksi
+---
 
-State WebSocket yang direncanakan:
+## 13. Gemini Protocol Adapter
 
-```text
-DISCONNECTED
-      │
-      ▼
-CONNECTING
-      │
-      ▼
-CONNECTED
-      │
-      ├──────────────┐
-      ▼              │
-ERROR / CLOSED ──────┘
-```
+Detail Gemini berada di `websocket_gemini.cpp`.
 
-State koneksi tidak menjadi state audio.
-
-## Gemini Protocol
-
-Detail format Gemini ditempatkan di layer WebSocket/Gemini adapter.
-
-Tujuannya agar Audio Engine hanya melihat konsep sederhana:
+Audio Engine cukup mengetahui konsep:
 
 ```text
 send audio
 receive audio
 connection status
+session status
 ```
 
 Audio Engine tidak perlu mengetahui:
 
 - JSON Gemini
-- header WebSocket
+- field JSON Gemini
 - URI Gemini
 - TLS detail
+- WebSocket opcode
+- format event network
 - authentication transport
-- format event jaringan
 
-## Prinsip Debugging
+Dengan demikian jika API/protokol Gemini berubah, dampaknya terlokalisasi.
 
-Arsitektur dibuat supaya sumber masalah dapat dipersempit.
+---
 
-### Jika microphone bermasalah
+## 14. Task dan Concurrency
+
+Target awal:
+
+```text
+WebSocket task
+└── transport/network
+
+Audio Engine task
+└── audio pipeline/playback
+
+Audio HAL
+└── hardware/DMA/I2S
+```
+
+Hindari desain seperti:
+
+```text
+WebSocket Task
+├── network
+├── JSON
+├── microphone
+├── I2S
+├── speaker
+├── audio processing
+└── Gemini
+```
+
+Task harus mempunyai pekerjaan sempit.
+
+Setiap queue/mutex harus mempunyai ownership yang jelas.
+
+---
+
+## 15. Error Handling
+
+Error dipisahkan berdasarkan layer.
+
+### Audio HAL
+
+```text
+I2S error
+DMA error
+MIC error
+SPEAKER error
+```
+
+### Audio Engine
+
+```text
+TX overflow
+RX overflow
+underrun
+buffer starvation
+processing error
+```
+
+### WebSocket
+
+```text
+DNS error
+TLS error
+connection error
+send error
+receive error
+protocol error
+reconnect error
+```
+
+Error dari satu layer dikirim sebagai status/event. Jangan langsung memanggil hardware layer dari layer yang tidak berwenang.
+
+---
+
+## 16. Debugging Strategy
+
+Arsitektur dibuat agar sumber masalah mudah dipersempit.
+
+### MIC tidak menghasilkan data
 
 ```text
 Audio HAL
 ```
 
-### Jika microphone normal tetapi TX tidak berjalan
+### MIC normal, tetapi TX kosong
 
 ```text
 Audio Engine
 ```
 
-### Jika TX keluar dari Audio Engine tetapi Gemini tidak menerima
+### TX keluar dari Audio Engine tetapi Gemini tidak menerima
 
 ```text
 WebSocket
 ```
 
-### Jika Gemini mengirim audio tetapi tidak sampai speaker
-
-Periksa berurutan:
+### Gemini mengirim data tetapi RX Audio Engine kosong
 
 ```text
-WebSocket
-   ↓
-Audio Engine
-   ↓
+WebSocket → Audio Engine interface
+```
+
+### RX Audio Engine ada tetapi speaker tidak bunyi
+
+```text
+Audio Engine → Audio HAL
+```
+
+### Speaker/I2S bermasalah
+
+```text
 Audio HAL
-   ↓
-Speaker
 ```
 
-## Prinsip Stack dan Task
+Dengan cara ini debugging tidak perlu membongkar seluruh firmware.
 
-Setiap task harus memiliki tanggung jawab sempit.
+---
 
-Hindari satu task besar seperti:
-
-```text
-WebSocket Task
- ├── WebSocket
- ├── JSON
- ├── Audio
- ├── I2S
- ├── Speaker
- ├── Microphone
- └── Gemini
-```
-
-Targetnya adalah:
-
-```text
-WebSocket Task
- └── transport/network
-
-Audio Engine Task
- └── audio pipeline
-
-Audio HAL
- └── hardware
-```
-
-Dengan pembagian ini, masalah stack overflow atau deadlock lebih mudah dilokalisasi.
-
-## Prinsip Utama RepoVersiEnam
+## 17. Aturan Keras Arsitektur
 
 1. **WebSocket hanya kurir.**
 2. **Audio Engine adalah pusat pipeline audio.**
 3. **Audio HAL hanya menangani hardware audio.**
-4. **WebSocket tidak mengakses I2S secara langsung.**
-5. **WebSocket tidak menulis speaker secara langsung.**
-6. **WebSocket tidak membaca microphone secara langsung.**
-7. **TX dan RX audio dipisahkan.**
-8. **Buffer audio dimiliki Audio Engine.**
-9. **Status koneksi dikirim sebagai event/status, bukan kontrol hardware langsung.**
-10. **Perubahan Gemini sebisa mungkin hanya menyentuh layer WebSocket/Gemini adapter.**
-11. **Setiap task mempunyai tanggung jawab yang sempit.**
-12. **API antar-komponen harus sederhana dan stabil.**
+4. **WebSocket tidak mengakses I2S.**
+5. **WebSocket tidak membaca microphone langsung.**
+6. **WebSocket tidak menulis speaker langsung.**
+7. **WebSocket tidak memiliki buffer audio utama.**
+8. **Audio Engine memiliki ownership TX/RX audio buffer.**
+9. **TX dan RX dipisahkan.**
+10. **State koneksi tidak boleh menjadi state audio.**
+11. **Reconnect menjadi tanggung jawab WebSocket.**
+12. **Gemini protocol diisolasi dalam adapter WebSocket.**
+13. **API antar-modul harus kecil dan stabil.**
+14. **Tidak boleh ada task raksasa yang mengurus seluruh sistem.**
+15. **`main.cpp` tetap kosong sesuai konsep RepoVersiEnam.**
 
-## Target Akhir
+---
 
-Target arsitektur RepoVersiEnam adalah:
+## 18. Kontrak Akhir
 
 ```text
-┌──────────┐
-│   MIC    │
-└────┬─────┘
-     ▼
-┌──────────┐
-│ AUDIO HAL│
-└────┬─────┘
-     ▼
-┌──────────────┐
-│ AUDIO ENGINE │
-└────┬─────────┘
-     │
-     ▼
-┌──────────────┐
-│  WEBSOCKET   │  ← hanya kurir
-└────┬─────────┘
-     ▼
-┌──────────────┐
-│    GEMINI    │
-└────┬─────────┘
-     │
-     ▼
-┌──────────────┐
-│  WEBSOCKET   │  ← hanya kurir
-└────┬─────────┘
-     ▼
-┌──────────────┐
-│ AUDIO ENGINE │
-└────┬─────────┘
-     ▼
-┌──────────┐
-│ AUDIO HAL│
-└────┬─────┘
-     ▼
-┌──────────┐
-│ SPEAKER  │
-└──────────┘
+                  NETWORK SIDE
+                       │
+                       ▼
+                ┌─────────────┐
+                │  WEBSOCKET  │
+                │   KURIR     │
+                └──────┬──────┘
+                       │
+                       ▼
+                    GEMINI
+                       │
+                       ▼
+                ┌─────────────┐
+                │  WEBSOCKET  │
+                │   KURIR     │
+                └──────┬──────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │   AUDIO ENGINE  │
+              │                 │
+              │ TX │ RX │ BUF   │
+              └───────┬─────────┘
+                      │
+                 audio API
+                      │
+                      ▼
+              ┌───────────────┐
+              │   AUDIO HAL   │
+              │ I2S / MIC /  │
+              │ SPEAKER       │
+              └───────┬───────┘
+                      │
+             ┌────────┴────────┐
+             ▼                 ▼
+            MIC              SPEAKER
 ```
 
-**Konsep ini menjadi kontrak arsitektur sebelum implementasi WebSocket RepoVersiEnam dimulai.**
+### Prinsip singkat
+
+> **Audio HAL = hardware.**  
+> **Audio Engine = otak audio.**  
+> **WebSocket = kurir.**  
+> **Gemini = server AI.**
+
+Dokumen ini menjadi patokan implementasi. Jika implementasi berikutnya bertentangan dengan aturan di atas, **arsitektur harus diperbaiki terlebih dahulu sebelum menambah fitur**.
+
+---
+
+## Referensi WebSocket
+
+RepoVersiEnam menggunakan `esp_websocket_client` sebagai implementasi transport WebSocket. Komponen tersebut mendukung koneksi WebSocket dan pengiriman data binary/text pada ESP-IDF. Versi dependency akan mengikuti konfigurasi project, bukan ditanamkan ke Audio Engine.
