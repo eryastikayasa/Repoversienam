@@ -1,0 +1,24 @@
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions/partitions.csv"
+
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+
+# ESP-SR WakeNet9 - Hi ESP
+CONFIG_SR_WN_WN9_HIESP=y
+
+# ESP-SR NSNet2 - noise suppression for far-field speech clarity
+CONFIG_SR_NSN_NSNET2=y
+
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# V7.0.19: prevent ESP WebSocket RX/TX lock contention during Gemini Live streaming.
+# ESP WebSocket Client provides a separate TX lock specifically for concurrent
+# send/receive traffic. This is important for full-duplex Gemini audio.
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000
