@@ -13,6 +13,7 @@ static const char *TAG = "WEBSOCKET";
 static esp_websocket_client_handle_t s_client = nullptr;
 static volatile bool s_connected = false;
 static volatile bool s_initialized = false;
+static volatile bool s_resume_attempted = false;
 static uint32_t s_generation = 0;
 static constexpr TickType_t CONNECT_WAIT_TICKS = pdMS_TO_TICKS(15000);
 
@@ -40,6 +41,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         s_connected = true;
+        s_resume_attempted = false;
         ++s_generation;
         ESP_LOGI(TAG, "WebSocket connected, generation=%lu", (unsigned long)s_generation);
         if (!websocket_gemini_on_connected(s_client, s_generation)) {
@@ -165,9 +167,10 @@ bool websocket_should_resume(void) { return websocket_gemini_should_resume(); }
 
 bool websocket_take_resume_request(void)
 {
-    /* A stored handle is not enough to trigger resume. Only a GoAway event
-     * requests an immediate reconnect; ordinary disconnect returns to WakeWord. */
-    return websocket_gemini_should_resume() && websocket_gemini_goaway_time_left_ms() > 0;
+    if (s_resume_attempted) return false;
+    if (!websocket_gemini_should_resume() || websocket_gemini_goaway_time_left_ms() == 0) return false;
+    s_resume_attempted = true;
+    return true;
 }
 
 uint64_t websocket_goaway_time_left_ms(void) { return websocket_gemini_goaway_time_left_ms(); }
