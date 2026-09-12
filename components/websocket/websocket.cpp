@@ -53,7 +53,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
     case WEBSOCKET_EVENT_DATA:
         if (s_connected && event && event->data_ptr && event->data_len > 0) {
-            websocket_gemini_on_data(static_cast<const uint8_t *>(event->data_ptr),
+            websocket_gemini_on_data(reinterpret_cast<const uint8_t *>(event->data_ptr),
                                      static_cast<size_t>(event->data_len),
                                      event->op_code, s_generation);
         }
