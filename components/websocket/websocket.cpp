@@ -3,6 +3,7 @@
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -49,8 +50,26 @@ static char *s_rx_assembling_buffer = nullptr;
 static size_t s_rx_expected = 0;
 static size_t s_rx_received = 0;
 static bool s_rx_assembling = false;
+static bool s_rx_text_message = false;
 static TaskHandle_t s_rx_worker_task = nullptr;
 static bool s_rx_worker_ready = false;
+
+static void log_rx_hex(const char *label, const char *data, size_t len)
+{
+    if (!data || len == 0) {
+        ESP_LOGI(TAG, "WS_RX: %s <empty>", label);
+        return;
+    }
+
+    char hex[3 * 16 + 1] = {0};
+    const size_t count = len < 16U ? len : 16U;
+    size_t w = 0;
+    for (size_t i = 0; i < count && w + 3U < sizeof(hex); ++i) {
+        w += (size_t)snprintf(hex + w, sizeof(hex) - w, "%02X%s",
+                              (unsigned char)data[i], i + 1U < count ? " " : "");
+    }
+    ESP_LOGI(TAG, "WS_RX: %s %s", label, hex);
+}
 
 static bool ensure_rx_worker(void)
 {
@@ -93,6 +112,8 @@ static bool ensure_rx_worker(void)
 
                     const size_t len = strlen(json);
                     ESP_LOGI(TAG, "WS_RX: RX message complete len=%u", (unsigned)len);
+                    log_rx_hex("worker first bytes:", json, len);
+                    if (len > 16U) log_rx_hex("worker last bytes:", json + len - 16U, 16U);
                     websocket_gemini_on_data(reinterpret_cast<const uint8_t *>(json),
                                              len, WEBSOCKET_EVENT_DATA, s_generation);
 
@@ -119,6 +140,7 @@ static void reset_rx(void)
     s_rx_expected = 0;
     s_rx_received = 0;
     s_rx_assembling = false;
+    s_rx_text_message = false;
 }
 
 static void handle_rx_data(esp_websocket_event_data_t *event)
@@ -128,16 +150,34 @@ static void handle_rx_data(esp_websocket_event_data_t *event)
     const size_t payload_len = (size_t)event->payload_len;
     const size_t payload_offset = (size_t)event->payload_offset;
     const size_t data_len = (size_t)event->data_len;
+    const uint8_t opcode = event->op_code;
+    const bool fin = event->fin;
 
-    ESP_LOGI(TAG, "WS_RX: DATA payload_len=%u", (unsigned)payload_len);
-    ESP_LOGI(TAG, "WS_RX: payload_offset=%u", (unsigned)payload_offset);
-    ESP_LOGI(TAG, "WS_RX: data_len=%u", (unsigned)data_len);
+    ESP_LOGI(TAG,
+             "WS_RX: DATA opcode=0x%02X fin=%d payload_len=%u payload_offset=%u data_len=%u",
+             opcode, fin ? 1 : 0, (unsigned)payload_len,
+             (unsigned)payload_offset, (unsigned)data_len);
+    log_rx_hex("first bytes:", event->data_ptr, data_len);
+    if (data_len > 16U) log_rx_hex("last bytes:", event->data_ptr + data_len - 16U, 16U);
 
     if (payload_len > RX_MAX_PAYLOAD ||
         payload_offset > payload_len ||
         data_len > payload_len - payload_offset) {
         ESP_LOGW(TAG, "WS_RX: invalid boundary total=%u offset=%u len=%u",
                  (unsigned)payload_len, (unsigned)payload_offset, (unsigned)data_len);
+        reset_rx();
+        return;
+    }
+
+    /* RFC 6455 data opcodes: 0=continuation, 1=text, 2=binary.
+     * Gemini Live protocol messages are JSON text. Never feed binary/control
+     * payloads to the JSON parser. */
+    if (opcode == 0x8U || opcode == 0x9U || opcode == 0xAU) {
+        ESP_LOGI(TAG, "WS_RX: control frame opcode=0x%02X ignored", opcode);
+        return;
+    }
+    if (opcode != 0x00U && opcode != 0x01U && opcode != 0x02U) {
+        ESP_LOGW(TAG, "WS_RX: unsupported data opcode=0x%02X dropped", opcode);
         reset_rx();
         return;
     }
@@ -150,6 +190,12 @@ static void handle_rx_data(esp_websocket_event_data_t *event)
 
     if (payload_offset == 0U) {
         reset_rx();
+
+        if (opcode != 0x01U && opcode != 0x02U) {
+            ESP_LOGW(TAG, "WS_RX: first message fragment opcode bukan TEXT/BINARY: 0x%02X", opcode);
+            return;
+        }
+
         if (xQueueReceive(s_rx_free_queue, &s_rx_assembling_buffer, 0) != pdPASS) {
             ESP_LOGW(TAG, "WS_RX: free queue empty; payload dropped");
             return;
@@ -157,18 +203,38 @@ static void handle_rx_data(esp_websocket_event_data_t *event)
         s_rx_expected = payload_len;
         s_rx_received = 0;
         s_rx_assembling = true;
+        s_rx_text_message = (opcode == 0x01U);
     } else if (!s_rx_assembling || s_rx_expected != payload_len ||
-               payload_offset != s_rx_received) {
+               payload_offset != s_rx_received || opcode != 0x00U) {
         ESP_LOGW(TAG,
-                 "WS_RX: fragment sequence invalid offset=%u received=%u expected=%u total=%u",
-                 (unsigned)payload_offset, (unsigned)s_rx_received,
+                 "WS_RX: fragment sequence invalid opcode=0x%02X offset=%u received=%u expected=%u total=%u",
+                 opcode, (unsigned)payload_offset, (unsigned)s_rx_received,
                  (unsigned)s_rx_expected, (unsigned)payload_len);
+        reset_rx();
+        return;
+    }
+
+    if (!s_rx_text_message) {
+        ESP_LOGW(TAG, "WS_RX: BINARY Gemini message tidak diparse sebagai JSON; total=%u",
+                 (unsigned)payload_len);
         reset_rx();
         return;
     }
 
     memcpy(s_rx_assembling_buffer + payload_offset, event->data_ptr, data_len);
     s_rx_received = payload_offset + data_len;
+
+    if (fin && s_rx_received != s_rx_expected) {
+        ESP_LOGW(TAG, "WS_RX: FIN sebelum payload lengkap received=%u expected=%u",
+                 (unsigned)s_rx_received, (unsigned)s_rx_expected);
+        reset_rx();
+        return;
+    }
+
+    if (!fin && s_rx_received == s_rx_expected) {
+        ESP_LOGW(TAG, "WS_RX: payload lengkap tetapi FIN=0; menunggu continuation");
+        return;
+    }
 
     if (s_rx_received != s_rx_expected) return;
 
@@ -178,6 +244,7 @@ static void handle_rx_data(esp_websocket_event_data_t *event)
     s_rx_expected = 0;
     s_rx_received = 0;
     s_rx_assembling = false;
+    s_rx_text_message = false;
 
     if (xQueueSend(s_rx_ready_queue, &ready, 0) != pdPASS) {
         ESP_LOGW(TAG, "WS_RX: ready queue penuh; payload dropped");
