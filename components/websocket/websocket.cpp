@@ -5,6 +5,7 @@
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "web_config.h"
 
 #include <stdio.h>
@@ -15,6 +16,7 @@ static esp_websocket_client_handle_t s_client = nullptr;
 static volatile bool s_connected = false;
 static volatile bool s_initialized = false;
 static uint32_t s_generation = 0;
+static constexpr TickType_t CONNECT_WAIT_TICKS = pdMS_TO_TICKS(15000);
 
 extern "C" bool websocket_gemini_on_connected(esp_websocket_client_handle_t client, uint32_t generation);
 extern "C" void websocket_gemini_on_disconnected(void);
@@ -135,10 +137,23 @@ bool websocket_connect(void)
     if (!s_initialized) websocket_init();
     if (!s_client) return false;
     if (s_connected) return true;
+
     const esp_err_t err = esp_websocket_client_start(s_client);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WebSocket start gagal: 0x%x", (unsigned)err);
         return false;
+    }
+
+    const TickType_t started = xTaskGetTickCount();
+    while (!s_connected) {
+        if ((xTaskGetTickCount() - started) >= CONNECT_WAIT_TICKS) {
+            ESP_LOGW(TAG, "WebSocket CONNECTED timeout (15s)");
+            (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
+            s_connected = false;
+            audio_engine_stop_input_session();
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
     return true;
 }
