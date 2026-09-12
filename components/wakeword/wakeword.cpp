@@ -32,32 +32,40 @@ static void wakeword_audio_cb(const uint8_t *pcm, size_t len, void *ctx)
     static int16_t buffer[WAKE_BUFFER_SAMPLES];
     static size_t samples = 0;
 
-    const size_t incoming = len / sizeof(int16_t);
-    if (incoming == 0) return;
     const int16_t *src = reinterpret_cast<const int16_t *>(pcm);
+    size_t remaining = len / sizeof(int16_t);
 
-    if (incoming > WAKE_BUFFER_SAMPLES || samples + incoming > WAKE_BUFFER_SAMPLES) {
-        samples = 0;
-    }
-
-    memcpy(buffer + samples, src, incoming * sizeof(int16_t));
-    samples += incoming;
-
-    while (samples >= static_cast<size_t>(s_chunk_samples) && s_armed) {
-        const int result = s_iface->detect(s_model, buffer);
-        if (result > 0) {
-            s_armed = false;
+    /* Audio Engine may deliver a frame larger than the WakeNet staging buffer.
+       Feed it in bounded pieces so memcpy can never exceed buffer capacity. */
+    while (remaining > 0 && s_armed) {
+        const size_t capacity = WAKE_BUFFER_SAMPLES - samples;
+        if (capacity == 0) {
             samples = 0;
-            ESP_LOGW(TAG, "WAKE WORD TERDETEKSI: HI, ESP (id=%d)", result);
-            if (s_callback) s_callback(s_callback_ctx);
-            return;
+            continue;
         }
 
-        const size_t remainder = samples - static_cast<size_t>(s_chunk_samples);
-        if (remainder > 0) {
-            memmove(buffer, buffer + s_chunk_samples, remainder * sizeof(int16_t));
+        const size_t copy_samples = remaining < capacity ? remaining : capacity;
+        memcpy(buffer + samples, src, copy_samples * sizeof(int16_t));
+        samples += copy_samples;
+        src += copy_samples;
+        remaining -= copy_samples;
+
+        while (samples >= static_cast<size_t>(s_chunk_samples) && s_armed) {
+            const int result = s_iface->detect(s_model, buffer);
+            if (result > 0) {
+                s_armed = false;
+                samples = 0;
+                ESP_LOGW(TAG, "WAKE WORD TERDETEKSI: HI, ESP (id=%d)", result);
+                if (s_callback) s_callback(s_callback_ctx);
+                return;
+            }
+
+            const size_t remainder = samples - static_cast<size_t>(s_chunk_samples);
+            if (remainder > 0) {
+                memmove(buffer, buffer + s_chunk_samples, remainder * sizeof(int16_t));
+            }
+            samples = remainder;
         }
-        samples = remainder;
     }
 }
 
