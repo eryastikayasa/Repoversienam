@@ -174,7 +174,7 @@ static bool send_setup(esp_websocket_client_handle_t client)
         escaped[w] = 0;
     }
     char json[8192] = {0};
-    const char *resume = s_resume_available ? ",\"sessionResumption\":{\"handle\":\"" : "";
+    const char *resume = s_resume_available ? ",\"sessionResumption\":{\"handle\":\"" : ",\"sessionResumption\":{}";
     const char *resume_end = s_resume_available ? "\"}" : "";
     const char *role_part = have_role ? ",\"systemInstruction\":{\"parts\":[{\"text\":\"" : "";
     const char *role_end = have_role ? "\"}]}" : "";
