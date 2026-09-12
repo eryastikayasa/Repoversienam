@@ -21,7 +21,6 @@ extern "C" void websocket_gemini_on_disconnected(void);
 extern "C" void websocket_gemini_on_data(const uint8_t *data, size_t len, int opcode, uint32_t generation);
 extern "C" bool websocket_gemini_setup_complete(void);
 extern "C" bool websocket_gemini_should_resume(void);
-extern "C" void websocket_gemini_clear_resume_request(void);
 extern "C" uint64_t websocket_gemini_goaway_time_left_ms(void);
 extern "C" bool websocket_gemini_send_audio(esp_websocket_client_handle_t client, const uint8_t *data, size_t len);
 extern "C" bool websocket_gemini_send_audio_stream_end(esp_websocket_client_handle_t client);
@@ -36,10 +35,8 @@ static void websocket_mic_sink(const uint8_t *pcm, size_t len, void *ctx)
 
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
-    (void)handler_args;
-    (void)base;
+    (void)handler_args; (void)base;
     esp_websocket_event_data_t *event = static_cast<esp_websocket_event_data_t *>(event_data);
-
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         s_connected = true;
@@ -57,8 +54,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
     case WEBSOCKET_EVENT_DATA:
         if (s_connected && event && event->data_ptr && event->data_len > 0) {
-            websocket_gemini_on_data(reinterpret_cast<const uint8_t *>(event->data_ptr),
-                                     static_cast<size_t>(event->data_len),
+            websocket_gemini_on_data((const uint8_t *)event->data_ptr,
+                                     (size_t)event->data_len,
                                      event->op_code, s_generation);
             if (websocket_gemini_setup_complete() && !audio_engine_input_session_active()) {
                 audio_engine_start_input_session();
@@ -72,14 +69,13 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             (void)websocket_gemini_send_audio_stream_end(s_client);
         audio_engine_stop_input_session();
         s_connected = false;
-        ESP_LOGW(TAG, "WebSocket disconnected");
         websocket_gemini_on_disconnected();
+        ESP_LOGW(TAG, "WebSocket disconnected");
         break;
 
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "WebSocket ERROR");
         break;
-
     default:
         break;
     }
@@ -101,7 +97,6 @@ void websocket_init(void)
 {
     if (s_initialized) return;
     if (!audio_engine_set_mic_sink(websocket_mic_sink, nullptr)) return;
-
     char uri[512] = {0};
     if (!build_server_uri(uri, sizeof(uri))) return;
 
@@ -130,11 +125,9 @@ bool websocket_connect(void)
     if (!s_client) return false;
     if (s_connected) return true;
     if (esp_websocket_client_start(s_client) != ESP_OK) return false;
-
     const TickType_t started = xTaskGetTickCount();
     while (!s_connected) {
         if ((xTaskGetTickCount() - started) >= CONNECT_WAIT_TICKS) {
-            ESP_LOGW(TAG, "WebSocket CONNECTED timeout (15s)");
             (void)esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
             return false;
         }
@@ -172,9 +165,9 @@ bool websocket_should_resume(void) { return websocket_gemini_should_resume(); }
 
 bool websocket_take_resume_request(void)
 {
-    if (!websocket_gemini_should_resume()) return false;
-    websocket_gemini_clear_resume_request();
-    return true;
+    /* A stored handle is not enough to trigger resume. Only a GoAway event
+     * requests an immediate reconnect; ordinary disconnect returns to WakeWord. */
+    return websocket_gemini_should_resume() && websocket_gemini_goaway_time_left_ms() > 0;
 }
 
 uint64_t websocket_goaway_time_left_ms(void) { return websocket_gemini_goaway_time_left_ms(); }
