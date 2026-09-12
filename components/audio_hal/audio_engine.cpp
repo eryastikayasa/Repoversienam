@@ -11,14 +11,12 @@
 #include <string.h>
 
 static const char *TAG = "AUDIO_ENGINE";
-
-/* Gemini Live output boundary: PCM16 mono, 24 kHz. */
 static constexpr uint32_t OUTPUT_RATE = 24000U;
-static constexpr size_t RING_BYTES = 64U * 1024U;       /* ~1.37 s max */
-static constexpr size_t PREBUFFER_BYTES = 6144U;        /* ~256 ms */
+static constexpr size_t RING_BYTES = 64U * 1024U;
+static constexpr size_t PREBUFFER_BYTES = 6144U;
 static constexpr size_t WARNING_BYTES = 3072U;
 static constexpr size_t CRITICAL_BYTES = 1024U;
-static constexpr size_t PLAYBACK_CHUNK = 640U;          /* ~26.7 ms */
+static constexpr size_t PLAYBACK_CHUNK = 640U;
 
 static volatile bool s_initialized = false;
 static volatile audio_engine_state_t s_state = AUDIO_ENGINE_IDLE;
@@ -56,10 +54,7 @@ static void set_state(audio_engine_state_t next)
     s_state = next;
 }
 
-static size_t pending_unlocked(void)
-{
-    return s_stream ? xStreamBufferBytesAvailable(s_stream) : 0;
-}
+static size_t pending_unlocked(void) { return s_stream ? xStreamBufferBytesAvailable(s_stream) : 0; }
 
 static size_t pending(void)
 {
@@ -106,14 +101,11 @@ static void playback_task(void *arg)
     static uint8_t pcm[PLAYBACK_CHUNK];
     bool started = false;
     int64_t last_stats_us = 0;
-
     ESP_LOGI(TAG, "Playback task: PCM16 mono %uHz, ring=%uB, prebuffer=%uB, chunk=%uB",
-             (unsigned)OUTPUT_RATE, (unsigned)RING_BYTES,
-             (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK);
+             (unsigned)OUTPUT_RATE, (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK);
 
     for (;;) {
         if (!s_stream) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
-
         const size_t before = pending();
         update_level(before);
         const bool active = audio_engine_turn_active();
@@ -151,7 +143,6 @@ static void playback_task(void *arg)
 
         got &= ~((size_t)1);
         if (!got) continue;
-
         if (!started) {
             started = true;
             s_turn.playback_started = true;
@@ -184,33 +175,16 @@ static void playback_task(void *arg)
 bool audio_engine_init(void)
 {
     if (s_initialized) return true;
-
     s_stream_mem = (uint8_t *)heap_caps_malloc(RING_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_stream_mem) s_stream_mem = (uint8_t *)heap_caps_malloc(RING_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!s_stream_mem) {
-        ESP_LOGE(TAG, "Audio ring allocation gagal: %uB", (unsigned)RING_BYTES);
-        s_state = AUDIO_ENGINE_ERROR;
-        return false;
-    }
-
+    if (!s_stream_mem) { s_state = AUDIO_ENGINE_ERROR; ESP_LOGE(TAG, "Audio ring allocation gagal: %uB", (unsigned)RING_BYTES); return false; }
     s_stream = xStreamBufferCreateStatic(RING_BYTES, PLAYBACK_CHUNK, s_stream_mem, &s_stream_storage);
     s_lock = xSemaphoreCreateMutexStatic(&s_lock_storage);
-    if (!s_stream || !s_lock) {
-        ESP_LOGE(TAG, "Audio stream/mutex init gagal");
-        s_state = AUDIO_ENGINE_ERROR;
-        return false;
-    }
-
+    if (!s_stream || !s_lock) { s_state = AUDIO_ENGINE_ERROR; ESP_LOGE(TAG, "Audio stream/mutex init gagal"); return false; }
     reset_turn(0);
-    if (xTaskCreatePinnedToCore(playback_task, "audio_playback", 4096, nullptr, 5, &s_playback_task, 0) != pdPASS) {
-        ESP_LOGE(TAG, "Playback task create gagal");
-        s_state = AUDIO_ENGINE_ERROR;
-        return false;
-    }
-
+    if (xTaskCreatePinnedToCore(playback_task, "audio_playback", 4096, nullptr, 5, &s_playback_task, 0) != pdPASS) { s_state = AUDIO_ENGINE_ERROR; ESP_LOGE(TAG, "Playback task create gagal"); return false; }
     s_initialized = true;
-    ESP_LOGI(TAG, "AudioEngine aktif: output=PCM16/24kHz, ring=%uB, prebuffer=%uB",
-             (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES);
+    ESP_LOGI(TAG, "AudioEngine aktif: output=PCM16/24kHz, ring=%uB, prebuffer=%uB", (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES);
     return true;
 }
 
@@ -223,10 +197,8 @@ bool audio_engine_turn_active(void)
         case AUDIO_ENGINE_BUFFERING:
         case AUDIO_ENGINE_PLAYING:
         case AUDIO_ENGINE_PLAYING_LOW:
-        case AUDIO_ENGINE_DRAINING:
-            return true;
-        default:
-            return false;
+        case AUDIO_ENGINE_DRAINING: return true;
+        default: return false;
     }
 }
 
@@ -235,44 +207,25 @@ const audio_engine_turn_t *audio_engine_get_turn(void) { return &s_turn; }
 void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 {
     if (!s_initialized) return;
-
     if (event == AUDIO_ENGINE_EVENT_GENERATION_CHANGED) {
-        flush_stream();
-        reset_turn(generation);
-        set_state(AUDIO_ENGINE_IDLE);
-        return;
+        flush_stream(); reset_turn(generation); set_state(AUDIO_ENGINE_IDLE); return;
     }
-
     if (generation && s_turn.generation && generation != s_turn.generation) return;
     if (generation && !s_turn.generation) s_turn.generation = generation;
 
     switch (event) {
         case AUDIO_ENGINE_EVENT_MODEL_BEGIN:
-            flush_stream();
-            reset_turn(generation);
-            set_state(AUDIO_ENGINE_BUFFERING);
-            break;
+            flush_stream(); reset_turn(generation); set_state(AUDIO_ENGINE_BUFFERING); break;
         case AUDIO_ENGINE_EVENT_MODEL_AUDIO:
-            if (!s_turn.model_started) s_turn.model_started = true;
-            if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE)
-                set_state(AUDIO_ENGINE_BUFFERING);
+            s_turn.model_started = true;
+            if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE) set_state(AUDIO_ENGINE_BUFFERING);
             break;
         case AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE:
-            s_turn.model_complete = true;
-            set_state(AUDIO_ENGINE_DRAINING);
-            break;
+            s_turn.model_complete = true; set_state(AUDIO_ENGINE_DRAINING); break;
         case AUDIO_ENGINE_EVENT_INTERRUPT:
-            /* Gemini explicitly defines interrupted as a signal to stop and
-             * empty realtime playback immediately. */
-            flush_stream();
-            s_turn.playback_drained = true;
-            set_state(AUDIO_ENGINE_INTERRUPTED);
-            break;
-        case AUDIO_ENGINE_EVENT_ERROR:
-            set_state(AUDIO_ENGINE_ERROR);
-            break;
-        default:
-            break;
+            flush_stream(); s_turn.playback_drained = true; set_state(AUDIO_ENGINE_INTERRUPTED); break;
+        case AUDIO_ENGINE_EVENT_ERROR: set_state(AUDIO_ENGINE_ERROR); break;
+        default: break;
     }
 }
 
@@ -282,6 +235,15 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
     if (generation && s_turn.generation && generation != s_turn.generation) return false;
     len &= ~((size_t)1);
     if (!len) return false;
+
+    /* A new model response starts a new playback turn. Do this before the
+     * bytes enter the ring so stale model_complete/INTERRUPTED state cannot
+     * cause the first PCM chunk to be treated as already drained. */
+    if (s_turn.model_complete || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE) {
+        flush_stream();
+        reset_turn(generation ? generation : s_turn.generation);
+        set_state(AUDIO_ENGINE_BUFFERING);
+    }
 
     size_t offset = 0;
     while (offset < len) {
@@ -293,17 +255,11 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
         } else if (!s_lock) {
             written = xStreamBufferSend(s_stream, pcm + offset, chunk, 0);
         }
-        if (!written) {
-            s_turn.network_drop += len - offset;
-            return offset != 0;
-        }
+        if (!written) { s_turn.network_drop += len - offset; return offset != 0; }
         s_turn.bytes_received += written;
         s_turn.bytes_queued += written;
         offset += written;
-        if (written < chunk) {
-            s_turn.network_drop += chunk - written;
-            return true;
-        }
+        if (written < chunk) { s_turn.network_drop += chunk - written; return true; }
     }
     return true;
 }
