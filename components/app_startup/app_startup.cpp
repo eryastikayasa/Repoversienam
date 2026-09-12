@@ -9,6 +9,7 @@
 #include "wakeword.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
