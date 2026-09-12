@@ -135,7 +135,7 @@ WebSocket tidak mengambil ownership buffer audio utama.
 ```text
 RepoVersiEnam/
 ├── main/
-│   ├── main.cpp                 ← KOSONG
+│   ├── main.cpp                
 │   └── CMakeLists.txt
 ├── components/
 │   ├── app_startup/             ← app_main()
