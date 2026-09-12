@@ -1,3 +1,5 @@
+#include "app_startup.h"
+
 #include "audio_hal.h"
 #include "audio_engine.h"
 #include "display_engine.h"
@@ -23,9 +25,9 @@ static void on_wakeword_detected(void *ctx)
     s_assistant_requested = true;
 }
 
-extern "C" void app_main(void)
+extern "C" void app_startup_run(void)
 {
-    ESP_LOGI(TAG, "Repo6 startup: main.cpp tetap kosong");
+    ESP_LOGI(TAG, "Repo6 startup: app_startup_run()");
 
     /* 1. NVS is the persistent source for WiFi/API key/Role. */
     esp_err_t nvs_err = nvs_flash_init();
@@ -93,7 +95,6 @@ extern "C" void app_main(void)
             websocket_init();
             if (!websocket_connect()) {
                 ESP_LOGE(TAG, "WebSocket Gemini gagal start");
-                /* Keep the Wake Word gate armed so the user can try again. */
                 (void)wakeword_rearm();
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
