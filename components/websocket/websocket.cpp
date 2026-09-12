@@ -14,7 +14,7 @@ static const char *TAG = "WEBSOCKET";
 static esp_websocket_client_handle_t s_client = nullptr;
 static volatile bool s_connected = false;
 static volatile bool s_initialized = false;
-static volatile uint32_t s_generation = 0;
+static uint32_t s_generation = 0;
 
 extern "C" bool websocket_gemini_on_connected(esp_websocket_client_handle_t client, uint32_t generation);
 extern "C" void websocket_gemini_on_disconnected(void);
@@ -52,8 +52,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
 
     case WEBSOCKET_EVENT_DATA:
-        if (s_connected && event && event->data && event->data_len > 0) {
-            websocket_gemini_on_data(static_cast<const uint8_t *>(event->data),
+        if (s_connected && event && event->data_ptr && event->data_len > 0) {
+            websocket_gemini_on_data(static_cast<const uint8_t *>(event->data_ptr),
                                      static_cast<size_t>(event->data_len),
                                      event->op_code, s_generation);
         }
