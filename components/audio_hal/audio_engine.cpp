@@ -13,10 +13,10 @@
 static const char *TAG = "AUDIO_ENGINE";
 static constexpr uint32_t OUTPUT_RATE = 24000U;
 static constexpr size_t RING_BYTES = 64U * 1024U;
-static constexpr size_t PREBUFFER_BYTES = 6144U;       /* 256 ms */
+static constexpr size_t PREBUFFER_BYTES = 6144U;
 static constexpr size_t WARNING_BYTES = 3072U;
 static constexpr size_t CRITICAL_BYTES = 1024U;
-static constexpr size_t PLAYBACK_CHUNK = 640U;         /* 13.3 ms at 24 kHz */
+static constexpr size_t PLAYBACK_CHUNK = 640U;
 static constexpr TickType_t LOCK_TIMEOUT = pdMS_TO_TICKS(2);
 static constexpr TickType_t PLAYBACK_YIELD = pdMS_TO_TICKS(1);
 
@@ -118,7 +118,7 @@ void audio_engine_log_diagnostics(const char *stage)
     if (s_playback_task) {
         ESP_LOGI(TAG, "TASK AUDIT audio_playback stack=%uB watermark=%uB priority=%u core=%d",
                  4096U, (unsigned)(uxTaskGetStackHighWaterMark(s_playback_task) * sizeof(StackType_t)),
-                 (unsigned)uxTaskPriorityGet(s_playback_task), (int)xTaskGetAffinity(s_playback_task));
+                 (unsigned)uxTaskPriorityGet(s_playback_task), (int)xTaskGetCoreID(s_playback_task));
     }
     ESP_LOGI(TAG, "AUDIO RAM MAP ring=%uB PSRAM/non-realtime prebuffer=%uB output_chunk=%uB",
              (unsigned)RING_BYTES, (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK);
@@ -214,9 +214,6 @@ static void playback_task(void *arg)
             audio_engine_log_diagnostics("playback");
         }
 
-        /* I2S can return quickly while DMA has room. Never let this task
-         * continuously drain the software ring without yielding to IDLE0,
-         * WiFi and other realtime work. */
         vTaskDelay(PLAYBACK_YIELD);
     }
 }
