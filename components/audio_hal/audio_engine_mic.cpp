@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include <string.h>
 
@@ -22,13 +23,23 @@ static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
 /* 16 x 20 ms = 320 ms. Bounded and deliberately below a one-second buffer. */
 static constexpr size_t MIC_TX_QUEUE_DEPTH = 16U;
+static constexpr TickType_t MIC_STOP_WAIT = pdMS_TO_TICKS(1000);
+
+enum mic_owner_t {
+    MIC_OWNER_NONE = 0,
+    MIC_OWNER_WAKEWORD,
+    MIC_OWNER_GEMINI_WAIT_GREETING_DRAIN,
+    MIC_OWNER_GEMINI
+};
 
 static audio_engine_mic_frame_cb_t s_mic_listener = nullptr;
 static void *s_mic_listener_ctx = nullptr;
 static audio_engine_mic_sink_cb_t s_mic_sink = nullptr;
 static void *s_mic_sink_ctx = nullptr;
 static volatile bool s_capture_started = false;
+static volatile bool s_capture_stop_requested = false;
 static volatile bool s_input_session_active = false;
+static volatile mic_owner_t s_mic_owner = MIC_OWNER_NONE;
 static int64_t s_last_activity_us = 0;
 static TaskHandle_t s_capture_task = nullptr;
 static TaskHandle_t s_sink_task = nullptr;
@@ -36,7 +47,24 @@ static TaskHandle_t s_sink_task = nullptr;
 static StaticQueue_t s_tx_queue_struct;
 static uint8_t s_tx_queue_storage[MIC_TX_QUEUE_DEPTH][MIC_FRAME_BYTES];
 static QueueHandle_t s_tx_queue = nullptr;
+static StaticSemaphore_t s_capture_stopped_storage;
+static SemaphoreHandle_t s_capture_stopped = nullptr;
 static uint32_t s_tx_queue_drops = 0;
+
+static const char *owner_name(mic_owner_t owner)
+{
+    switch (owner) {
+        case MIC_OWNER_WAKEWORD: return "WAKEWORD";
+        case MIC_OWNER_GEMINI_WAIT_GREETING_DRAIN: return "GEMINI_WAIT_GREETING_DRAIN";
+        case MIC_OWNER_GEMINI: return "GEMINI";
+        default: return "NONE";
+    }
+}
+
+static void log_owner(mic_owner_t owner)
+{
+    ESP_LOGI(TAG, "MIC OWNER: %s", owner_name(owner));
+}
 
 static bool frame_has_activity(const uint8_t *data, size_t len)
 {
@@ -83,7 +111,7 @@ static void sink_task(void *arg)
              (unsigned)(MIC_TX_QUEUE_DEPTH * 20U), (unsigned)MIC_FRAME_BYTES);
     for (;;) {
         if (xQueueReceive(s_tx_queue, frame, portMAX_DELAY) != pdTRUE) continue;
-        if (!s_input_session_active) continue;
+        if (!s_input_session_active || s_mic_owner != MIC_OWNER_GEMINI) continue;
 
         audio_engine_mic_sink_cb_t sink = s_mic_sink;
         void *sink_ctx = s_mic_sink_ctx;
@@ -98,17 +126,27 @@ static void capture_task(void *arg)
     static uint8_t frame_buffer[MIC_FRAME_BYTES];
     size_t frame_pos = 0;
 
-    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, read=%uB, idle=%ums",
-             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_READ_BYTES, (unsigned)MIC_IDLE_TIMEOUT_MS);
+    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, read=%uB, idle=%ums owner=%s",
+             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_READ_BYTES, (unsigned)MIC_IDLE_TIMEOUT_MS,
+             owner_name(s_mic_owner));
 
     for (;;) {
+        if (s_capture_stop_requested || s_mic_owner == MIC_OWNER_NONE) break;
+
         const size_t bytes = audio_read_mic(read_buffer, sizeof(read_buffer));
         if (bytes == 0) {
+            if (s_capture_stop_requested) break;
             vTaskDelay(1);
             continue;
         }
 
-        if (s_mic_listener) s_mic_listener(read_buffer, bytes, s_mic_listener_ctx);
+        if (s_capture_stop_requested || s_mic_owner == MIC_OWNER_NONE) break;
+
+        if (s_mic_owner == MIC_OWNER_WAKEWORD && s_mic_listener)
+            s_mic_listener(read_buffer, bytes, s_mic_listener_ctx);
+
+        if (s_capture_stop_requested || s_mic_owner != MIC_OWNER_GEMINI)
+            continue;
 
         size_t offset = 0;
         while (offset < bytes) {
@@ -121,7 +159,7 @@ static void capture_task(void *arg)
             if (frame_pos != MIC_FRAME_BYTES) continue;
             frame_pos = 0;
 
-            if (!s_input_session_active) {
+            if (!s_input_session_active || s_mic_owner != MIC_OWNER_GEMINI) {
                 vTaskDelay(1);
                 continue;
             }
@@ -151,6 +189,16 @@ static void capture_task(void *arg)
             }
         }
     }
+
+    s_input_session_active = false;
+    s_capture_started = false;
+    s_capture_stop_requested = false;
+    s_mic_owner = MIC_OWNER_NONE;
+    s_capture_task = nullptr;
+    log_owner(MIC_OWNER_NONE);
+    ESP_LOGI(TAG, "MIC capture task benar-benar berhenti");
+    if (s_capture_stopped) xSemaphoreGive(s_capture_stopped);
+    vTaskDelete(nullptr);
 }
 
 bool audio_engine_set_mic_listener(audio_engine_mic_frame_cb_t cb, void *ctx)
@@ -167,50 +215,109 @@ bool audio_engine_set_mic_sink(audio_engine_mic_sink_cb_t cb, void *ctx)
     return true;
 }
 
-bool audio_engine_start_capture(void)
+static bool start_capture_for_owner(mic_owner_t owner)
 {
-    if (s_capture_started) return true;
-
-    s_tx_queue = xQueueCreateStatic(
-        MIC_TX_QUEUE_DEPTH,
-        MIC_FRAME_BYTES,
-        &s_tx_queue_storage[0][0],
-        &s_tx_queue_struct);
+    if (owner != MIC_OWNER_WAKEWORD && owner != MIC_OWNER_GEMINI) return false;
+    if (s_capture_task) return s_mic_owner == owner;
     if (!s_tx_queue) {
-        ESP_LOGE(TAG, "Gagal membuat MIC transport queue");
+        s_tx_queue = xQueueCreateStatic(
+            MIC_TX_QUEUE_DEPTH,
+            MIC_FRAME_BYTES,
+            &s_tx_queue_storage[0][0],
+            &s_tx_queue_struct);
+        if (!s_tx_queue) {
+            ESP_LOGE(TAG, "Gagal membuat MIC transport queue");
+            return false;
+        }
+    }
+
+    if (!s_capture_stopped)
+        s_capture_stopped = xSemaphoreCreateBinaryStatic(&s_capture_stopped_storage);
+    if (!s_capture_stopped) {
+        ESP_LOGE(TAG, "Gagal membuat MIC capture completion semaphore");
         return false;
     }
 
-    BaseType_t sink_rc = xTaskCreatePinnedToCore(
-        sink_task, "mic_tx", 3072, nullptr, 4, &s_sink_task, 0);
-    if (sink_rc != pdPASS) {
-        s_sink_task = nullptr;
-        s_tx_queue = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat MIC transport worker");
-        return false;
+    if (!s_sink_task) {
+        BaseType_t sink_rc = xTaskCreatePinnedToCore(
+            sink_task, "mic_tx", 3072, nullptr, 4, &s_sink_task, 0);
+        if (sink_rc != pdPASS) {
+            s_sink_task = nullptr;
+            ESP_LOGE(TAG, "Gagal membuat MIC transport worker");
+            return false;
+        }
     }
 
+    s_capture_stop_requested = false;
+    s_mic_owner = owner;
     BaseType_t rc = xTaskCreatePinnedToCore(
         capture_task, "audio_capture", 4096, nullptr, 5, &s_capture_task, 1);
     if (rc != pdPASS) {
         s_capture_task = nullptr;
-        s_sink_task = nullptr;
-        s_tx_queue = nullptr;
+        s_mic_owner = MIC_OWNER_NONE;
         ESP_LOGE(TAG, "Gagal membuat AudioEngine capture task");
         return false;
     }
 
     s_capture_started = true;
+    log_owner(owner);
     log_mic_task_audit("capture_start");
+    return true;
+}
+
+bool audio_engine_start_capture(void)
+{
+    if (s_capture_task) return s_mic_owner == MIC_OWNER_WAKEWORD;
+    return start_capture_for_owner(MIC_OWNER_WAKEWORD);
+}
+
+bool audio_engine_request_capture_stop(void)
+{
+    if (!s_capture_task) return true;
+    if (s_mic_owner == MIC_OWNER_WAKEWORD) log_owner(MIC_OWNER_STOPPING_WAKEWORD);
+    s_capture_stop_requested = true;
+    return true;
+}
+
+bool audio_engine_stop_capture_and_wait(void)
+{
+    if (!s_capture_task) return true;
+    if (!s_capture_stopped) return false;
+    (void)audio_engine_request_capture_stop();
+    if (xSemaphoreTake(s_capture_stopped, MIC_STOP_WAIT) != pdTRUE) {
+        ESP_LOGE(TAG, "MIC capture task tidak berhenti dalam %ums", (unsigned)(MIC_STOP_WAIT * portTICK_PERIOD_MS));
+        return false;
+    }
+    if (s_capture_task) {
+        ESP_LOGE(TAG, "MIC capture task handle masih aktif setelah stop");
+        return false;
+    }
+    return true;
+}
+
+bool audio_engine_prepare_gemini_input(void)
+{
+    if (s_capture_task || s_mic_owner == MIC_OWNER_WAKEWORD || s_mic_owner == MIC_OWNER_STOPPING_WAKEWORD) {
+        ESP_LOGW(TAG, "MIC owner masih aktif; Gemini input belum boleh mengambil MIC");
+        return false;
+    }
+    s_mic_owner = MIC_OWNER_GEMINI_WAIT_GREETING_DRAIN;
+    log_owner(MIC_OWNER_GEMINI_WAIT_GREETING_DRAIN);
     return true;
 }
 
 void audio_engine_start_input_session(void)
 {
-    if (!s_capture_started) {
-        ESP_LOGW(TAG, "start_input_session sebelum capture aktif");
+    if (s_mic_owner != MIC_OWNER_GEMINI_WAIT_GREETING_DRAIN) {
+        ESP_LOGW(TAG, "MIC session START ditolak: owner=%s, expected=GEMINI_WAIT_GREETING_DRAIN", owner_name(s_mic_owner));
         return;
     }
+    if (s_capture_task) {
+        ESP_LOGE(TAG, "MIC session START ditolak: capture task masih aktif");
+        return;
+    }
+    if (!start_capture_for_owner(MIC_OWNER_GEMINI)) return;
+
     s_last_activity_us = esp_timer_get_time();
     s_input_session_active = true;
     ESP_LOGI(TAG, "MIC session START: AudioEngine -> transport");
@@ -227,5 +334,10 @@ void audio_engine_stop_input_session(void)
 
 bool audio_engine_input_session_active(void)
 {
-    return s_input_session_active;
+    return s_input_session_active && s_mic_owner == MIC_OWNER_GEMINI;
+}
+
+bool audio_engine_mic_capture_active(void)
+{
+    return s_capture_task != nullptr;
 }
