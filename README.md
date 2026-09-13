@@ -401,3 +401,28 @@ Speaker
 "Halo, ada yang bisa dibantu?"
  ↓
 baru MIC aktif untuk user
+
+
+Target Repo6 setelah penyesuaian
+
+MIC
+ ↓
+Audio HAL
+ ↓
+Audio Engine
+ ↓
+WebSocket
+ ↓
+Gemini
+ ↓
+WebSocket
+ ↓
+Gemini Audio Parser
+ ↓
+Base64 decode
+ ↓
+PCM Gemini
+ ↓
+Audio Engine Speaker Input
+ ↓
+Speaker
