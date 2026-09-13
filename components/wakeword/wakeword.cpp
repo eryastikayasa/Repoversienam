@@ -35,8 +35,6 @@ static void wakeword_audio_cb(const uint8_t *pcm, size_t len, void *ctx)
     const int16_t *src = reinterpret_cast<const int16_t *>(pcm);
     size_t remaining = len / sizeof(int16_t);
 
-    /* Audio Engine may deliver a frame larger than the WakeNet staging buffer.
-       Feed it in bounded pieces so memcpy can never exceed buffer capacity. */
     while (remaining > 0 && s_armed) {
         const size_t capacity = WAKE_BUFFER_SAMPLES - samples;
         if (capacity == 0) {
@@ -56,6 +54,7 @@ static void wakeword_audio_cb(const uint8_t *pcm, size_t len, void *ctx)
                 s_armed = false;
                 samples = 0;
                 ESP_LOGW(TAG, "WAKE WORD TERDETEKSI: HI, ESP (id=%d)", result);
+                (void)audio_engine_request_capture_stop();
                 if (s_callback) s_callback(s_callback_ctx);
                 return;
             }
@@ -139,12 +138,32 @@ bool wakeword_start(wakeword_detected_cb_t cb, void *ctx)
     return wakeword_rearm();
 }
 
+bool wakeword_stop(void)
+{
+    if (!s_ready) return false;
+    s_armed = false;
+    ESP_LOGI(TAG, "Wake word STOP: release MIC capture requested");
+    (void)audio_engine_request_capture_stop();
+    return true;
+}
+
 bool wakeword_rearm(void)
 {
     if (!s_ready) return false;
     s_armed = true;
+    if (!audio_engine_set_mic_listener(wakeword_audio_cb, nullptr)) {
+        s_armed = false;
+        return false;
+    }
+    if (!audio_engine_mic_capture_active()) {
+        if (!audio_engine_start_capture()) {
+            s_armed = false;
+            ESP_LOGE(TAG, "Gagal mengambil kembali MIC untuk WakeWord");
+            return false;
+        }
+    }
     ESP_LOGI(TAG, "Wake word ARMED: HI, ESP");
-    return audio_engine_set_mic_listener(wakeword_audio_cb, nullptr);
+    return true;
 }
 
 bool wakeword_is_ready(void)
