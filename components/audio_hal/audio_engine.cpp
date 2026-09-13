@@ -12,11 +12,11 @@
 
 static const char *TAG = "AUDIO_ENGINE";
 static constexpr uint32_t OUTPUT_RATE = 24000U;
-static constexpr size_t RING_BYTES = 64U * 1024U;
-static constexpr size_t PREBUFFER_BYTES = 6144U;
-static constexpr size_t WARNING_BYTES = 3072U;
-static constexpr size_t CRITICAL_BYTES = 1024U;
-static constexpr size_t PLAYBACK_CHUNK = 640U;
+static constexpr size_t RING_BYTES = 512U * 1024U;
+static constexpr size_t PREBUFFER_BYTES = 128U * 1024U;
+static constexpr size_t WARNING_BYTES = 32U * 1024U;
+static constexpr size_t CRITICAL_BYTES = 16U * 1024U;
+static constexpr size_t PLAYBACK_CHUNK = 2048U;
 static constexpr TickType_t LOCK_TIMEOUT = pdMS_TO_TICKS(2);
 static constexpr TickType_t PLAYBACK_YIELD = pdMS_TO_TICKS(1);
 
