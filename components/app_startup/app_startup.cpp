@@ -201,6 +201,10 @@ extern "C" void app_startup_run(void)
             s_session_was_connected = false;
             s_assistant_requested = false;
             ESP_LOGI(TAG, "Sesi Gemini selesai -> kembali menunggu Wake Word");
+            audio_engine_stop_input_session();
+            if (!audio_engine_stop_capture_and_wait()) {
+                ESP_LOGE(TAG, "MIC Gemini gagal dilepas saat sesi selesai");
+            }
             (void)wakeword_rearm();
             audio_engine_log_diagnostics("gemini_disconnected");
         }
