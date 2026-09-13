@@ -21,7 +21,7 @@ static constexpr TickType_t LOCK_TIMEOUT = pdMS_TO_TICKS(2);
 static constexpr TickType_t PLAYBACK_YIELD = pdMS_TO_TICKS(1);
 
 static volatile bool s_initialized = false;
-static volatile audio_engine_state_t s_state = AUDIO_ENGINE_IDLE;
+static volatile bool s_state = AUDIO_ENGINE_IDLE;
 static audio_engine_turn_t s_turn = {};
 static TaskHandle_t s_playback_task = nullptr;
 static StreamBufferHandle_t s_stream = nullptr;
@@ -31,6 +31,7 @@ static StaticStreamBuffer_t s_stream_storage;
 static uint8_t *s_stream_mem = nullptr;
 static int64_t s_last_audio_us = 0;
 static uint8_t s_level = 0;
+static volatile bool s_input_session_after_drain = false;
 
 static const char *state_name(audio_engine_state_t state)
 {
@@ -52,7 +53,7 @@ static const char *state_name(audio_engine_state_t state)
 static void set_state(audio_engine_state_t next)
 {
     if (s_state == next) return;
-    ESP_LOGI(TAG, "STATE: %s -> %s", state_name(s_state), state_name(next));
+    ESP_LOGI(TAG, "STATE: %s -> %s", state_name((audio_engine_state_t)s_state), state_name(next));
     s_state = next;
 }
 
@@ -161,6 +162,8 @@ static void playback_task(void *arg)
 
         if (got == 0) {
             if (s_turn.model_complete && pending() == 0) {
+                const bool start_input_after_drain = s_input_session_after_drain;
+                s_input_session_after_drain = false;
                 s_turn.playback_drained = true;
                 s_turn.pending_bytes = 0;
                 started = false;
@@ -168,6 +171,10 @@ static void playback_task(void *arg)
                 set_state(AUDIO_ENGINE_COMPLETE);
                 display_face_set_state(FACE_LISTENING);
                 set_state(AUDIO_ENGINE_IDLE);
+                if (start_input_after_drain) {
+                    audio_engine_start_input_session();
+                    ESP_LOGI(TAG, "Greeting playback drained -> MIC input session started");
+                }
             } else if (started && active && !s_turn.model_complete) {
                 ++s_turn.underrun_count;
                 started = false;
@@ -192,11 +199,20 @@ static void playback_task(void *arg)
         }
 
         const size_t played = audio_write_speaker(pcm, got);
+        const bool first_play = (s_turn.bytes_played == 0);
         s_turn.bytes_played += played;
         if (played < got) s_turn.playback_drop += got - played;
         s_turn.pending_bytes = pending();
         s_last_audio_us = esp_timer_get_time();
         update_level(s_turn.pending_bytes);
+
+        if (first_play) {
+            if (played > 0) {
+                ESP_LOGI(TAG, "AUDIO_ENGINE PCM PLAYED: audio_write_speaker=%uB pending=%uB", (unsigned)played, (unsigned)s_turn.pending_bytes);
+            } else {
+                ESP_LOGW(TAG, "AUDIO_ENGINE PCM PLAYED: audio_write_speaker returned 0 for %uB", (unsigned)got);
+            }
+        }
 
         const int64_t now = esp_timer_get_time();
         if (!last_stats_us || now - last_stats_us >= 1000000LL) {
@@ -254,12 +270,12 @@ bool audio_engine_init(void)
     return true;
 }
 
-audio_engine_state_t audio_engine_get_state(void) { return s_state; }
+audio_engine_state_t audio_engine_get_state(void) { return (audio_engine_state_t)s_state; }
 const char *audio_engine_state_name(audio_engine_state_t state) { return state_name(state); }
 
 bool audio_engine_turn_active(void)
 {
-    switch (s_state) {
+    switch ((audio_engine_state_t)s_state) {
         case AUDIO_ENGINE_BUFFERING:
         case AUDIO_ENGINE_PLAYING:
         case AUDIO_ENGINE_PLAYING_LOW:
@@ -279,6 +295,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
     if (event == AUDIO_ENGINE_EVENT_GENERATION_CHANGED) {
         flush_stream();
         reset_turn(generation);
+        s_input_session_after_drain = false;
         set_state(AUDIO_ENGINE_IDLE);
         return;
     }
@@ -290,12 +307,13 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
         case AUDIO_ENGINE_EVENT_MODEL_BEGIN:
             flush_stream();
             reset_turn(generation);
+            s_input_session_after_drain = false;
             set_state(AUDIO_ENGINE_BUFFERING);
             audio_engine_log_diagnostics("model_begin");
             break;
         case AUDIO_ENGINE_EVENT_MODEL_AUDIO:
             s_turn.model_started = true;
-            if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE)
+            if ((audio_engine_state_t)s_state == AUDIO_ENGINE_IDLE || (audio_engine_state_t)s_state == AUDIO_ENGINE_INTERRUPTED || (audio_engine_state_t)s_state == AUDIO_ENGINE_COMPLETE)
                 set_state(AUDIO_ENGINE_BUFFERING);
             break;
         case AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE:
@@ -306,6 +324,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             flush_stream();
             s_turn.playback_drained = true;
             s_turn.model_complete = false;
+            s_input_session_after_drain = false;
             set_state(AUDIO_ENGINE_INTERRUPTED);
             break;
         case AUDIO_ENGINE_EVENT_ERROR:
@@ -323,7 +342,7 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
     len &= ~((size_t)1);
     if (!len) return false;
 
-    if (s_turn.model_complete || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE) {
+    if (s_turn.model_complete || (audio_engine_state_t)s_state == AUDIO_ENGINE_INTERRUPTED || (audio_engine_state_t)s_state == AUDIO_ENGINE_COMPLETE) {
         flush_stream();
         reset_turn(generation ? generation : s_turn.generation);
         set_state(AUDIO_ENGINE_BUFFERING);
@@ -352,4 +371,11 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
         }
     }
     return true;
+}
+
+void audio_engine_request_input_session_after_drain(void)
+{
+    if (!s_initialized) return;
+    s_input_session_after_drain = true;
+    ESP_LOGI(TAG, "MIC input session requested after playback drain");
 }
