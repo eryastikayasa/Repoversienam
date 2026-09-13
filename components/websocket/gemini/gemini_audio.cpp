@@ -83,6 +83,13 @@ bool gemini_audio_process_server_message(const char *json, size_t len, uint32_t 
                 ESP_LOGW(TAG, "GEMINI_AUDIO: AudioEngine reject PCM bytes=%u",
                          (unsigned)decoded_len);
             } else {
+                const audio_engine_turn_t *turn = audio_engine_get_turn();
+                if (turn && turn->bytes_queued == decoded_len) {
+                    ESP_LOGI(TAG, "AUDIO_ENGINE PCM QUEUED: rx=%llu queued=%llu pending=%uB",
+                             (unsigned long long)turn->bytes_received,
+                             (unsigned long long)turn->bytes_queued,
+                             (unsigned)turn->pending_bytes);
+                }
                 audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_AUDIO, generation);
                 handled = true;
             }
