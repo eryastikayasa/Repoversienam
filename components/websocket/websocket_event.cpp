@@ -28,6 +28,8 @@ static char *s_rx_buffers[RX_BUFFER_COUNT] = {};
 static char *s_rx_assembling_buffer = nullptr;
 static size_t s_rx_expected = 0;
 static size_t s_rx_received = 0;
+static uint8_t s_rx_first_opcode = 0;
+static uint32_t s_rx_generation = 0;
 static bool s_rx_assembling = false;
 static TaskHandle_t s_rx_worker_task = nullptr;
 static bool s_rx_worker_ready = false;
@@ -84,7 +86,11 @@ static void reset_rx(void)
         if (!s_rx_free_queue || xQueueSend(s_rx_free_queue, &s_rx_assembling_buffer, 0) != pdPASS) ESP_LOGW(TAG, "WS_RX: assembly buffer gagal dikembalikan");
         s_rx_assembling_buffer = nullptr;
     }
-    s_rx_expected = 0; s_rx_received = 0; s_rx_assembling = false;
+    s_rx_expected = 0;
+    s_rx_received = 0;
+    s_rx_first_opcode = 0;
+    s_rx_generation = 0;
+    s_rx_assembling = false;
 }
 
 static void handle_data_event(esp_websocket_event_data_t *event)
@@ -111,21 +117,37 @@ static void handle_data_event(esp_websocket_event_data_t *event)
         reset_rx();
         if (opcode != 0x01U && opcode != 0x02U) { ESP_LOGW(TAG, "WS_RX: first fragment must be TEXT/BINARY, opcode=0x%02X", opcode); return; }
         if (xQueueReceive(s_rx_free_queue, &s_rx_assembling_buffer, 0) != pdPASS) { ESP_LOGW(TAG, "WS_RX: free queue empty; payload dropped"); return; }
-        s_rx_expected = payload_len; s_rx_received = 0; s_rx_assembling = true;
-    } else if (!s_rx_assembling || s_rx_expected != payload_len || payload_offset != s_rx_received || opcode != 0x00U) {
-        ESP_LOGW(TAG, "WS_RX: fragment sequence invalid opcode=0x%02X offset=%u received=%u expected=%u total=%u", opcode, (unsigned)payload_offset, (unsigned)s_rx_received, (unsigned)s_rx_expected, (unsigned)payload_len);
-        reset_rx(); return;
+        s_rx_expected = payload_len;
+        s_rx_received = 0;
+        s_rx_first_opcode = opcode;
+        s_rx_generation = websocket_transport_generation();
+        s_rx_assembling = true;
+    } else {
+        const bool opcode_matches_message = (opcode == 0x00U || opcode == s_rx_first_opcode);
+        if (!s_rx_assembling || s_rx_expected != payload_len || payload_offset != s_rx_received || !opcode_matches_message) {
+            ESP_LOGW(TAG, "WS_RX: fragment sequence invalid opcode=0x%02X first_opcode=0x%02X offset=%u received=%u expected=%u total=%u", opcode, s_rx_first_opcode, (unsigned)payload_offset, (unsigned)s_rx_received, (unsigned)s_rx_expected, (unsigned)payload_len);
+            reset_rx(); return;
+        }
     }
 
     memcpy(s_rx_assembling_buffer + payload_offset, event->data_ptr, data_len);
     s_rx_received = payload_offset + data_len;
-    if (fin && s_rx_received != s_rx_expected) { ESP_LOGW(TAG, "WS_RX: FIN before payload complete received=%u expected=%u", (unsigned)s_rx_received, (unsigned)s_rx_expected); reset_rx(); return; }
-    if (!fin && s_rx_received == s_rx_expected) { ESP_LOGI(TAG, "WS_RX: payload bytes complete but FIN=0; waiting continuation"); return; }
+
+    // Repo6's WebSocket driver can report FIN=1 on every callback chunk. The
+    // authoritative assembly boundary is payload_offset + data_len == payload_len.
+    if (fin && s_rx_received != s_rx_expected) {
+        ESP_LOGI(TAG, "WS_RX: FIN reported on partial chunk; continuing offset=%u/%u", (unsigned)s_rx_received, (unsigned)s_rx_expected);
+    }
     if (s_rx_received != s_rx_expected) return;
 
     s_rx_assembling_buffer[s_rx_expected] = '\0';
-    rx_item_t item = {s_rx_assembling_buffer, s_rx_expected, websocket_transport_generation()};
-    s_rx_assembling_buffer = nullptr; s_rx_expected = 0; s_rx_received = 0; s_rx_assembling = false;
+    rx_item_t item = {s_rx_assembling_buffer, s_rx_expected, s_rx_generation};
+    s_rx_assembling_buffer = nullptr;
+    s_rx_expected = 0;
+    s_rx_received = 0;
+    s_rx_first_opcode = 0;
+    s_rx_generation = 0;
+    s_rx_assembling = false;
     if (xQueueSend(s_rx_ready_queue, &item, 0) != pdPASS) {
         ESP_LOGW(TAG, "WS_RX: ready queue penuh; payload dropped");
         if (xQueueSend(s_rx_free_queue, &item.buffer, 0) != pdPASS) ESP_LOGE(TAG, "WS_RX: RX buffer hilang");
