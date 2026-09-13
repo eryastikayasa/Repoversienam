@@ -133,23 +133,45 @@ WebSocket tidak mengambil ownership buffer audio utama.
 ## Struktur Utama
 
 ```text
-RepoVersiEnam/
+Repoversienam/
+│
 ├── main/
-│   ├── main.cpp                
-│   └── CMakeLists.txt
+│   └── main.cpp
+│
 ├── components/
-│   ├── app_startup/             ← app_main()
-│   ├── audio_hal/               ← HAL + Audio Engine
-│   ├── wakeword/                ← WakeNet Hi ESP
-│   ├── websocket/               ← transport + Gemini adapter
-│   ├── wifi_manager/
-│   ├── uart_control/
-│   ├── web_config/
-│   └── display/
-├── partitions/
-├── platformio.ini
+│   ├── app_startup/
+│   │
+│   ├── audio_hal/
+│   │   ├── audio_hal.cpp
+│   │   ├── audio_engine.cpp
+│   │   ├── audio_engine_ingest.cpp
+│   │   ├── audio_engine_mic.cpp
+│   │   └── include/
+│   │
+│   ├── websocket/
+│   │   ├── websocket.cpp
+│   │   ├── websocket_audio.cpp
+│   │   ├── websocket_event.cpp
+│   │   ├── websocket_transport.cpp
+│   │   ├── include/
+│   │   └── gemini/
+│   │       ├── gemini_protocol.cpp
+│   │       ├── gemini_message.cpp
+│   │       └── gemini_audio.cpp
+│   │
+│   ├── wakeword/
+│   │
+│   ├── display/
+│   │   ├── display_driver/
+│   │   ├── display_engine/
+│   │   ├── display_face/
+│   │   └── display_text/
+│   │
+│   └── uart_control/
+│
 ├── CMakeLists.txt
-└── README.md
+├── README.md
+└── .github/workflows/build.yml
 ```
 
 ### Prinsip singkat
