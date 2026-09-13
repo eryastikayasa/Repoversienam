@@ -215,9 +215,9 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
              cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(server, "turnComplete")));
         if (done) {
             s_greeting_finished = true;
-            ESP_LOGI(TAG, "WS_GEMINI: Greeting selesai");
-            ESP_LOGI(TAG, "WEBSOCKET: Greeting selesai -> MIC streaming ENABLED");
-            audio_engine_start_input_session();
+            ESP_LOGI(TAG, "WS_GEMINI: Greeting server turn selesai; menunggu playback drain");
+            ESP_LOGI(TAG, "WEBSOCKET: Greeting audio drain dulu -> MIC streaming ENABLED setelah drain");
+            audio_engine_request_input_session_after_drain();
         }
     }
     cJSON_Delete(root);
