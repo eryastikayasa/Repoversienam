@@ -132,7 +132,7 @@ extern "C" void app_startup_run(void)
 
     if (!wakeword_init()) return;
     if (!wakeword_start(on_wakeword_detected, nullptr)) return;
-    if (!audio_engine_start_capture()) return;
+    if (!audio_engine_mic_capture_active() && !audio_engine_start_capture()) return;
     boot_button_init();
 
     ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi -> Wake Word");
@@ -146,6 +146,21 @@ extern "C" void app_startup_run(void)
 
         if (s_assistant_requested && !websocket_is_connected()) {
             s_assistant_requested = false;
+            ESP_LOGI(TAG, "Trigger -> hentikan WakeWord dan lepaskan MIC");
+            (void)wakeword_stop();
+            if (!audio_engine_stop_capture_and_wait()) {
+                ESP_LOGE(TAG, "MIC ownership transition gagal -> WakeWord");
+                (void)wakeword_rearm();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            if (!audio_engine_prepare_gemini_input()) {
+                ESP_LOGE(TAG, "MIC ownership Gemini gagal -> WakeWord");
+                (void)wakeword_rearm();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
             ESP_LOGI(TAG, "Trigger -> buka sesi Gemini");
             websocket_init();
             if (!websocket_connect()) {
@@ -159,6 +174,14 @@ extern "C" void app_startup_run(void)
         if (!websocket_is_connected() && websocket_take_resume_request()) {
             ESP_LOGW(TAG, "Gemini GoAway: mencoba session resumption (timeLeft=%llums)",
                      (unsigned long long)websocket_goaway_time_left_ms());
+            (void)wakeword_stop();
+            if (!audio_engine_stop_capture_and_wait() || !audio_engine_prepare_gemini_input()) {
+                ESP_LOGE(TAG, "MIC ownership transition gagal untuk session resumption -> Wake Word");
+                s_session_was_connected = false;
+                s_assistant_requested = false;
+                (void)wakeword_rearm();
+                continue;
+            }
             if (!websocket_connect()) {
                 ESP_LOGW(TAG, "Session resumption gagal -> Wake Word");
                 s_session_was_connected = false;
