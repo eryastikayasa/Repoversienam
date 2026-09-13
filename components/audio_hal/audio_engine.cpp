@@ -164,6 +164,7 @@ static void playback_task(void *arg)
                 s_turn.playback_drained = true;
                 s_turn.pending_bytes = 0;
                 started = false;
+                s_turn.model_complete = false;
                 set_state(AUDIO_ENGINE_COMPLETE);
                 display_face_set_state(FACE_LISTENING);
                 set_state(AUDIO_ENGINE_IDLE);
@@ -304,6 +305,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
         case AUDIO_ENGINE_EVENT_INTERRUPT:
             flush_stream();
             s_turn.playback_drained = true;
+            s_turn.model_complete = false;
             set_state(AUDIO_ENGINE_INTERRUPTED);
             break;
         case AUDIO_ENGINE_EVENT_ERROR:
