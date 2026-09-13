@@ -21,7 +21,7 @@ static constexpr TickType_t LOCK_TIMEOUT = pdMS_TO_TICKS(2);
 static constexpr TickType_t PLAYBACK_YIELD = pdMS_TO_TICKS(1);
 
 static volatile bool s_initialized = false;
-static volatile bool s_state = AUDIO_ENGINE_IDLE;
+static volatile audio_engine_state_t s_state = AUDIO_ENGINE_IDLE;
 static audio_engine_turn_t s_turn = {};
 static TaskHandle_t s_playback_task = nullptr;
 static StreamBufferHandle_t s_stream = nullptr;
@@ -53,7 +53,7 @@ static const char *state_name(audio_engine_state_t state)
 static void set_state(audio_engine_state_t next)
 {
     if (s_state == next) return;
-    ESP_LOGI(TAG, "STATE: %s -> %s", state_name((audio_engine_state_t)s_state), state_name(next));
+    ESP_LOGI(TAG, "STATE: %s -> %s", state_name(s_state), state_name(next));
     s_state = next;
 }
 
@@ -270,12 +270,12 @@ bool audio_engine_init(void)
     return true;
 }
 
-audio_engine_state_t audio_engine_get_state(void) { return (audio_engine_state_t)s_state; }
+audio_engine_state_t audio_engine_get_state(void) { return s_state; }
 const char *audio_engine_state_name(audio_engine_state_t state) { return state_name(state); }
 
 bool audio_engine_turn_active(void)
 {
-    switch ((audio_engine_state_t)s_state) {
+    switch (s_state) {
         case AUDIO_ENGINE_BUFFERING:
         case AUDIO_ENGINE_PLAYING:
         case AUDIO_ENGINE_PLAYING_LOW:
@@ -313,7 +313,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             break;
         case AUDIO_ENGINE_EVENT_MODEL_AUDIO:
             s_turn.model_started = true;
-            if ((audio_engine_state_t)s_state == AUDIO_ENGINE_IDLE || (audio_engine_state_t)s_state == AUDIO_ENGINE_INTERRUPTED || (audio_engine_state_t)s_state == AUDIO_ENGINE_COMPLETE)
+            if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE)
                 set_state(AUDIO_ENGINE_BUFFERING);
             break;
         case AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE:
@@ -342,7 +342,7 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
     len &= ~((size_t)1);
     if (!len) return false;
 
-    if (s_turn.model_complete || (audio_engine_state_t)s_state == AUDIO_ENGINE_INTERRUPTED || (audio_engine_state_t)s_state == AUDIO_ENGINE_COMPLETE) {
+    if (s_turn.model_complete || s_state == AUDIO_ENGINE_INTERRUPTED || s_state == AUDIO_ENGINE_COMPLETE) {
         flush_stream();
         reset_turn(generation ? generation : s_turn.generation);
         set_state(AUDIO_ENGINE_BUFFERING);
