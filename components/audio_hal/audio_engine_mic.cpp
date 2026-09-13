@@ -28,6 +28,7 @@ static constexpr TickType_t MIC_STOP_WAIT = pdMS_TO_TICKS(1000);
 enum mic_owner_t {
     MIC_OWNER_NONE = 0,
     MIC_OWNER_WAKEWORD,
+    MIC_OWNER_STOPPING_WAKEWORD,
     MIC_OWNER_GEMINI_WAIT_GREETING_DRAIN,
     MIC_OWNER_GEMINI
 };
@@ -55,6 +56,7 @@ static const char *owner_name(mic_owner_t owner)
 {
     switch (owner) {
         case MIC_OWNER_WAKEWORD: return "WAKEWORD";
+        case MIC_OWNER_STOPPING_WAKEWORD: return "STOPPING_WAKEWORD";
         case MIC_OWNER_GEMINI_WAIT_GREETING_DRAIN: return "GEMINI_WAIT_GREETING_DRAIN";
         case MIC_OWNER_GEMINI: return "GEMINI";
         default: return "NONE";
@@ -131,7 +133,8 @@ static void capture_task(void *arg)
              owner_name(s_mic_owner));
 
     for (;;) {
-        if (s_capture_stop_requested || s_mic_owner == MIC_OWNER_NONE) break;
+        if (s_capture_stop_requested || s_mic_owner == MIC_OWNER_NONE || s_mic_owner == MIC_OWNER_STOPPING_WAKEWORD)
+            break;
 
         const size_t bytes = audio_read_mic(read_buffer, sizeof(read_buffer));
         if (bytes == 0) {
@@ -140,7 +143,8 @@ static void capture_task(void *arg)
             continue;
         }
 
-        if (s_capture_stop_requested || s_mic_owner == MIC_OWNER_NONE) break;
+        if (s_capture_stop_requested || s_mic_owner == MIC_OWNER_NONE || s_mic_owner == MIC_OWNER_STOPPING_WAKEWORD)
+            break;
 
         if (s_mic_owner == MIC_OWNER_WAKEWORD && s_mic_listener)
             s_mic_listener(read_buffer, bytes, s_mic_listener_ctx);
@@ -157,6 +161,7 @@ static void capture_task(void *arg)
             offset += copy_len;
 
             if (frame_pos != MIC_FRAME_BYTES) continue;
+
             frame_pos = 0;
 
             if (!s_input_session_active || s_mic_owner != MIC_OWNER_GEMINI) {
@@ -219,6 +224,7 @@ static bool start_capture_for_owner(mic_owner_t owner)
 {
     if (owner != MIC_OWNER_WAKEWORD && owner != MIC_OWNER_GEMINI) return false;
     if (s_capture_task) return s_mic_owner == owner;
+
     if (!s_tx_queue) {
         s_tx_queue = xQueueCreateStatic(
             MIC_TX_QUEUE_DEPTH,
@@ -274,7 +280,10 @@ bool audio_engine_start_capture(void)
 bool audio_engine_request_capture_stop(void)
 {
     if (!s_capture_task) return true;
-    if (s_mic_owner == MIC_OWNER_WAKEWORD) log_owner(MIC_OWNER_STOPPING_WAKEWORD);
+    if (s_mic_owner == MIC_OWNER_WAKEWORD) {
+        s_mic_owner = MIC_OWNER_STOPPING_WAKEWORD;
+        log_owner(MIC_OWNER_STOPPING_WAKEWORD);
+    }
     s_capture_stop_requested = true;
     return true;
 }
