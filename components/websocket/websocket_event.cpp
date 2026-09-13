@@ -34,17 +34,6 @@ static bool s_rx_assembling = false;
 static TaskHandle_t s_rx_worker_task = nullptr;
 static bool s_rx_worker_ready = false;
 
-static void log_hex(const char *label, const uint8_t *data, size_t len)
-{
-    if (!data || len == 0) { ESP_LOGI(TAG, "WS_RX: %s <empty>", label); return; }
-    char hex[3 * 16 + 1] = {0};
-    const size_t count = len < 16U ? len : 16U;
-    size_t w = 0;
-    for (size_t i = 0; i < count && w + 3U < sizeof(hex); ++i)
-        w += (size_t)snprintf(hex + w, sizeof(hex) - w, "%02X%s", data[i], i + 1U < count ? " " : "");
-    ESP_LOGI(TAG, "WS_RX: %s %s", label, hex);
-}
-
 static bool ensure_rx_worker(void)
 {
     if (s_rx_worker_ready) return true;
@@ -67,8 +56,6 @@ static bool ensure_rx_worker(void)
                     ESP_LOGW(TAG, "WS_RX: stale message generation=%lu current=%lu dropped", (unsigned long)item.generation, (unsigned long)current_generation);
                 } else {
                     ESP_LOGI(TAG, "WS_RX: complete message len=%u generation=%lu", (unsigned)item.len, (unsigned long)item.generation);
-                    log_hex("worker first bytes:", reinterpret_cast<const uint8_t *>(item.buffer), item.len);
-                    if (item.len > 16U) log_hex("worker last bytes:", reinterpret_cast<const uint8_t *>(item.buffer + item.len - 16U), 16U);
                     (void)gemini_protocol_process_message(item.buffer, item.len, item.generation);
                 }
                 if (xQueueSend(s_rx_free_queue, &item.buffer, portMAX_DELAY) != pdPASS) ESP_LOGE(TAG, "WS_RX: gagal mengembalikan RX buffer");
@@ -98,19 +85,21 @@ static void handle_data_event(esp_websocket_event_data_t *event)
     if (!event || !event->data_ptr || event->data_len <= 0 || event->payload_len <= 0) return;
     const uint8_t raw_opcode = event->op_code;
     const uint8_t opcode = raw_opcode & 0x0FU;
-    const bool fin = event->fin;
     const size_t payload_len = (size_t)event->payload_len;
     const size_t payload_offset = (size_t)event->payload_offset;
     const size_t data_len = (size_t)event->data_len;
-    ESP_LOGI(TAG, "WS_RX: DATA raw_opcode=0x%02X opcode=0x%02X fin=%d payload_len=%u payload_offset=%u data_len=%u", raw_opcode, opcode, fin ? 1 : 0, (unsigned)payload_len, (unsigned)payload_offset, (unsigned)data_len);
-    log_hex("first bytes:", reinterpret_cast<const uint8_t *>(event->data_ptr), data_len);
-    if (data_len > 16U) log_hex("last bytes:", reinterpret_cast<const uint8_t *>(event->data_ptr + data_len - 16U), 16U);
+
+    // IMPORTANT: this callback executes synchronously on websocket_task.
+    // Do not perform per-chunk UART logging or other blocking work here.
     if (payload_len > RX_MAX_PAYLOAD || payload_offset > payload_len || data_len > payload_len - payload_offset) {
         ESP_LOGW(TAG, "WS_RX: invalid boundary total=%u offset=%u len=%u", (unsigned)payload_len, (unsigned)payload_offset, (unsigned)data_len);
         reset_rx(); return;
     }
-    if (opcode == 0x8U || opcode == 0x9U || opcode == 0xAU) { ESP_LOGI(TAG, "WS_RX: control frame opcode=0x%02X ignored", opcode); return; }
-    if (opcode != 0x00U && opcode != 0x01U && opcode != 0x02U) { ESP_LOGW(TAG, "WS_RX: unsupported opcode=0x%02X dropped", opcode); reset_rx(); return; }
+    if (opcode == 0x8U || opcode == 0x9U || opcode == 0xAU) return;
+    if (opcode != 0x00U && opcode != 0x01U && opcode != 0x02U) {
+        ESP_LOGW(TAG, "WS_RX: unsupported opcode=0x%02X dropped", opcode);
+        reset_rx(); return;
+    }
     if (!ensure_rx_worker()) { ESP_LOGW(TAG, "WS_RX: RX worker unavailable; payload dropped"); reset_rx(); return; }
 
     if (payload_offset == 0U) {
@@ -133,11 +122,7 @@ static void handle_data_event(esp_websocket_event_data_t *event)
     memcpy(s_rx_assembling_buffer + payload_offset, event->data_ptr, data_len);
     s_rx_received = payload_offset + data_len;
 
-    // Repo6's WebSocket driver can report FIN=1 on every callback chunk. The
-    // authoritative assembly boundary is payload_offset + data_len == payload_len.
-    if (fin && s_rx_received != s_rx_expected) {
-        ESP_LOGI(TAG, "WS_RX: FIN reported on partial chunk; continuing offset=%u/%u", (unsigned)s_rx_received, (unsigned)s_rx_expected);
-    }
+    // FIN is not authoritative here: this driver can report FIN=1 on partial chunks.
     if (s_rx_received != s_rx_expected) return;
 
     s_rx_assembling_buffer[s_rx_expected] = '\0';
