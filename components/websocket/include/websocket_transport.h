@@ -19,7 +19,10 @@ uint32_t websocket_transport_generation(void);
 esp_err_t websocket_transport_send_text(const char *text, size_t len);
 void websocket_transport_profile_snapshot(uint64_t *poll_write_us,
                                           uint64_t *tls_write_us,
-                                          uint64_t *transport_write_us);
+                                          uint64_t *transport_write_us,
+                                          int *last_poll_write_ret,
+                                          int *last_transport_write_ret,
+                                          ssize_t *last_tls_write_ret);
 void websocket_transport_event_connected(void);
 void websocket_transport_event_disconnected(void);
 
