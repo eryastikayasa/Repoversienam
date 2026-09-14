@@ -105,32 +105,48 @@ static void draw_text_window(const char *text, uint16_t visible_len, int text_x)
         draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[first + i]);
 }
 
+static bool is_printable_ascii(unsigned char c)
+{
+    return c >= 0x20 && c <= 0x7E;
+}
+
+// Replace the target while preserving the already-typed common prefix.
+// No local transcript-sized buffer is used: this function is also callable
+// from the WebSocket/Gemini path and must not grow its stack footprint.
 static void set_target_text(char *dst, size_t dst_size, const char *text, uint16_t &visible_len)
 {
     if (!dst || dst_size == 0) return;
 
-    char sanitized[TRANSCRIPT_TEXT_CAP] = {0};
+    const size_t old_len = strlen(dst);
+    size_t new_len = 0;
+    size_t common = 0;
+    bool common_active = true;
+
     if (text) {
-        size_t out = 0;
-        for (size_t i = 0; text[i] != '\0' && out + 1 < sizeof(sanitized); ++i) {
+        for (size_t i = 0; text[i] != '\0'; ++i) {
             const unsigned char c = (unsigned char)text[i];
-            if (c >= 0x20 && c <= 0x7E) sanitized[out++] = (char)c;
+            if (!is_printable_ascii(c)) continue;
+            if (new_len + 1U >= dst_size) break;
+            if (common_active && common < old_len && dst[common] == (char)c) ++common;
+            else common_active = false;
+            ++new_len;
         }
-        sanitized[out] = '\0';
     }
 
-    const size_t old_len = strlen(dst);
-    const size_t new_len = strlen(sanitized);
-    if (old_len == new_len && strcmp(dst, sanitized) == 0) return;
-
-    size_t common = 0;
-    while (common < old_len && common < new_len && dst[common] == sanitized[common]) ++common;
+    if (old_len == new_len && common == old_len) return;
 
     size_t current_visible = visible_len;
     if (current_visible > old_len) current_visible = old_len;
     if (current_visible > common) current_visible = common;
 
-    memcpy(dst, sanitized, new_len + 1U);
+    size_t out = 0;
+    if (text) {
+        for (size_t i = 0; text[i] != '\0' && out + 1U < dst_size; ++i) {
+            const unsigned char c = (unsigned char)text[i];
+            if (is_printable_ascii(c)) dst[out++] = (char)c;
+        }
+    }
+    dst[out] = '\0';
     visible_len = (uint16_t)current_visible;
 }
 
@@ -218,8 +234,10 @@ void display_text_update(uint32_t now_ms)
     if (s_last_type_ms == 0) s_last_type_ms = now_ms;
     const uint32_t type_elapsed = now_ms - s_last_type_ms;
     if (type_elapsed >= TEXT_TYPE_INTERVAL_MS) {
-        if (s_user_visible_len < strlen(s_user_target)) ++s_user_visible_len;
-        if (s_gemini_visible_len < strlen(s_gemini_target)) ++s_gemini_visible_len;
+        const size_t user_len = strlen(s_user_target);
+        const size_t gemini_len = strlen(s_gemini_target);
+        if (s_user_visible_len < user_len) ++s_user_visible_len;
+        if (s_gemini_visible_len < gemini_len) ++s_gemini_visible_len;
         s_last_type_ms = now_ms;
     }
 
@@ -258,7 +276,7 @@ void display_text_append_user(const char *text)
         if (out > 0 && s_user_target[out - 1] != ' ') s_user_target[out++] = ' ';
         for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_user_target); ++i) {
             const unsigned char c = (unsigned char)text[i];
-            if (c >= 0x20 && c <= 0x7E) s_user_target[out++] = (char)c;
+            if (is_printable_ascii(c)) s_user_target[out++] = (char)c;
         }
         s_user_target[out] = '\0';
     }
@@ -273,7 +291,7 @@ void display_text_append_gemini(const char *text)
         if (out > 0 && s_gemini_target[out - 1] != ' ') s_gemini_target[out++] = ' ';
         for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_gemini_target); ++i) {
             const unsigned char c = (unsigned char)text[i];
-            if (c >= 0x20 && c <= 0x7E) s_gemini_target[out++] = (char)c;
+            if (is_printable_ascii(c)) s_gemini_target[out++] = (char)c;
         }
         s_gemini_target[out] = '\0';
     }
@@ -287,7 +305,7 @@ void display_text_set_status(const char *text)
     if (text) {
         for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_status_text); ++i) {
             const unsigned char c = (unsigned char)text[i];
-            if (c >= 0x20 && c <= 0x7E) s_status_text[out++] = (char)c;
+            if (is_printable_ascii(c)) s_status_text[out++] = (char)c;
         }
     }
     s_status_text[out] = '\0';
@@ -364,7 +382,7 @@ void display_text_render_status(void)
         return;
     }
 
-    int x = OLED_WIDTH - (int)offset;
+    const int x = OLED_WIDTH - (int)offset;
     for (size_t i = 0; i < len; ++i) {
         const int px = x + (int)i * CHAR_WIDTH;
         if (px + 5 >= 0 && px < OLED_WIDTH) draw_text_char(px, TEXT_Y, text[i]);
