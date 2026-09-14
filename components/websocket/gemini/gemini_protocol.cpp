@@ -24,8 +24,6 @@ static char s_setup_role[2048] = {0};
 static char s_setup_json[8192] = {0};
 static uint64_t s_goaway_ms = 0;
 
-// Transcript state lives on the protocol RX path, not in display_engine.
-// The display receives only the already-decoded text.
 static char s_user_transcript[512] = {0};
 static char s_user_interim[512] = {0};
 static char s_gemini_transcript[512] = {0};
@@ -69,38 +67,25 @@ static void clear_gemini_transcript(void)
     display_text_set_gemini("");
 }
 
-/*
- * Gemini Live emits server updates incrementally. Different transcription
- * updates can be cumulative ("halo" -> "halo apa") or fragment-like
- * ("halo" -> " apa"). Prefix-aware merging supports both without ever
- * duplicating the cumulative example into "halo halo apa".
- */
+// Handles both cumulative partials ("halo" -> "halo apa") and delta-like
+// fragments ("halo" -> "apa"), without duplicating cumulative text.
 static void merge_transcript(char *dst, size_t cap, const char *incoming)
 {
     if (!dst || cap == 0 || !incoming || !incoming[0]) return;
-
     while (*incoming == ' ' || *incoming == '\n' || *incoming == '\r' || *incoming == '\t') ++incoming;
     if (!incoming[0]) return;
 
     const size_t current_len = strlen(dst);
     const size_t incoming_len = strlen(incoming);
-    if (current_len == 0) {
-        copy_text(dst, cap, incoming);
-        return;
-    }
-
+    if (current_len == 0) { copy_text(dst, cap, incoming); return; }
     if (strcmp(dst, incoming) == 0) return;
 
-    // Cumulative/full partial: replace the previous hypothesis.
     if (incoming_len >= current_len && strncmp(incoming, dst, current_len) == 0) {
         copy_text(dst, cap, incoming);
         return;
     }
-
-    // Older cumulative hypothesis arrived after a shorter update.
     if (current_len >= incoming_len && strncmp(dst, incoming, incoming_len) == 0) return;
 
-    // Delta/fragment: append with a single separator when needed.
     size_t out = current_len;
     if (out + 1U < cap && out > 0 && dst[out - 1U] != ' ' && incoming[0] != ' ')
         dst[out++] = ' ';
@@ -129,12 +114,13 @@ static void handle_input_transcription(const char *text, bool interim)
     }
 
     if (interim) {
-        // Interim input is a replaceable hypothesis, not committed history.
         copy_text(s_user_interim, sizeof(s_user_interim), text);
     } else {
-        // inputTranscription is authoritative/final for the spoken segment.
         merge_transcript(s_user_transcript, sizeof(s_user_transcript), text);
         s_user_interim[0] = '\0';
+        // Final transcript closes this speech segment. A future interim/final
+        // after the turn boundary starts a fresh visible user transcript.
+        s_user_turn_active = false;
     }
     publish_user_text();
 }
@@ -142,7 +128,6 @@ static void handle_input_transcription(const char *text, bool interim)
 static void handle_output_transcription(const char *text)
 {
     if (!text || !text[0]) return;
-
     if (!s_gemini_turn_active) {
         clear_gemini_transcript();
         s_gemini_turn_active = true;
@@ -245,9 +230,6 @@ static bool build_setup(void)
         ok = ok && add_setup_string(part, "text", s_setup_role);
     }
 
-    // Input transcription is already part of Repo6 setup. Enable output
-    // transcription as well so OLED text can come only from Gemini's own
-    // spoken output transcript.
     ok = ok && cJSON_AddItemToObject(setup, "inputAudioTranscription", input_transcription);
     ok = ok && cJSON_AddItemToObject(setup, "outputAudioTranscription", output_transcription);
     ok = ok && cJSON_AddItemToObject(setup, "sessionResumption", session);
@@ -344,8 +326,6 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
             break;
         }
 
-        // These fields are the only source of conversation text for OLED.
-        // They are handled here while the JSON is already parsed on the RX path.
         cJSON *interim_input = cJSON_GetObjectItemCaseSensitive(server, "interimInputTranscription");
         cJSON *input = cJSON_GetObjectItemCaseSensitive(server, "inputTranscription");
         cJSON *output = cJSON_GetObjectItemCaseSensitive(server, "outputTranscription");
@@ -363,9 +343,6 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
             if (cJSON_IsString(text) && text->valuestring) handle_output_transcription(text->valuestring);
         }
 
-        /* After the greeting turn, the next server-content event is the real
-         * Gemini response path. Face THINKING is still driven by actual server
-         * content; playback switches to SPEAKING when PCM reaches the speaker. */
         if (s_greeting_finished && !cJSON_IsObject(output)) {
             display_set_system_state(FACE_THINKING, "Berpikir...");
         }
