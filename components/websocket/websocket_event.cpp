@@ -14,9 +14,7 @@
 
 static const char *TAG = "WS_EVENT";
 static constexpr size_t RX_MAX_PAYLOAD = 64U * 1024U;
-/* Transport staging is short-lived: callback -> ready queue -> worker copy. */
 static constexpr size_t RX_STAGING_COUNT = 2U;
-/* Processing buffers live only for the CPU-heavy Gemini processing lifetime. */
 static constexpr size_t RX_PROCESS_COUNT = 3U;
 static constexpr uint32_t RX_WORKER_STACK = 8192U;
 static constexpr UBaseType_t RX_WORKER_PRIORITY = 3U;
@@ -28,12 +26,12 @@ struct rx_item_t { char *buffer; size_t len; uint32_t generation; };
 static QueueHandle_t s_rx_staging_free_queue = nullptr;
 static QueueHandle_t s_rx_ready_queue = nullptr;
 static QueueHandle_t s_rx_process_free_queue = nullptr;
-static StaticQueue_t s_rx_staging_free_storage;
+static StaticQueue_t s_rx_staging_free_queue_storage;
 static StaticQueue_t s_rx_ready_queue_storage;
-static StaticQueue_t s_rx_process_free_storage;
-static char *s_rx_staging_free_storage[RX_STAGING_COUNT];
-static rx_item_t s_rx_ready_storage[RX_STAGING_COUNT];
-static char *s_rx_process_free_storage[RX_PROCESS_COUNT];
+static StaticQueue_t s_rx_process_free_queue_storage;
+static char *s_rx_staging_free_queue_items[RX_STAGING_COUNT];
+static rx_item_t s_rx_ready_queue_items[RX_STAGING_COUNT];
+static char *s_rx_process_free_queue_items[RX_PROCESS_COUNT];
 static char *s_rx_staging_buffers[RX_STAGING_COUNT] = {};
 static char *s_rx_process_buffers[RX_PROCESS_COUNT] = {};
 
@@ -47,13 +45,11 @@ static uint8_t s_rx_first_opcode = 0;
 static uint32_t s_rx_generation = 0;
 static bool s_rx_assembling = false;
 
-/* When an offset-0 fragment cannot be accepted, consume the remaining
- * fragments silently instead of creating a cascade of "fragment invalid"
- * logs. A new offset-0 message always starts a new decision. */
+/* If an offset-0 payload cannot be accepted, consume its remaining chunks
+ * silently. A new offset-0 payload always starts a new decision. */
 static bool s_rx_discarding = false;
 static size_t s_rx_discard_expected = 0;
 static size_t s_rx_discard_received = 0;
-static uint32_t s_rx_discard_generation = 0;
 
 static TaskHandle_t s_rx_worker_task = nullptr;
 static bool s_rx_worker_ready = false;
@@ -82,9 +78,7 @@ static void note_staging_depth(void)
 {
     if (!s_rx_staging_free_queue) return;
     const UBaseType_t free_count = uxQueueMessagesWaiting(s_rx_staging_free_queue);
-    uint32_t old_low = __atomic_load_n(&s_rx_free_lowwater, __ATOMIC_RELAXED);
-    while (old_low > (uint32_t)free_count &&
-           !__atomic_compare_exchange_n(&s_rx_free_lowwater, &old_low, (uint32_t)free_count, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    metric_max(&s_rx_free_lowwater, RX_STAGING_COUNT - (uint32_t)free_count);
 }
 
 static void note_ready_highwater(void)
@@ -97,15 +91,13 @@ static void note_process_free_depth(void)
 {
     if (!s_rx_process_free_queue) return;
     const UBaseType_t free_count = uxQueueMessagesWaiting(s_rx_process_free_queue);
-    uint32_t old_low = __atomic_load_n(&s_rx_process_free_lowwater, __ATOMIC_RELAXED);
-    while (old_low > (uint32_t)free_count &&
-           !__atomic_compare_exchange_n(&s_rx_process_free_lowwater, &old_low, (uint32_t)free_count, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    metric_max(&s_rx_process_free_lowwater, RX_PROCESS_COUNT - (uint32_t)free_count);
 }
 
 static void log_rx_metrics(const char *reason)
 {
     ESP_LOGI(TAG,
-             "RX METRICS[%s] chunks=%lu bytes=%llu queue_high=%lu free_low=%lu process_free_low=%lu drops=%lu fragments=%lu processed=%lu cb_max_us=%lu process_max_us=%lu",
+             "RX METRICS[%s] chunks=%lu bytes=%llu queue_high=%lu staging_used_high=%lu process_used_high=%lu drops=%lu fragments=%lu processed=%lu cb_max_us=%lu process_max_us=%lu",
              reason ? reason : "periodic",
              (unsigned long)__atomic_load_n(&s_rx_chunks, __ATOMIC_RELAXED),
              (unsigned long long)__atomic_load_n(&s_rx_bytes, __ATOMIC_RELAXED),
@@ -134,11 +126,11 @@ static bool ensure_rx_worker(void)
     if (s_rx_worker_ready) return true;
 
     s_rx_staging_free_queue = xQueueCreateStatic(
-        RX_STAGING_COUNT, sizeof(char *), reinterpret_cast<uint8_t *>(s_rx_staging_free_storage), &s_rx_staging_free_storage);
+        RX_STAGING_COUNT, sizeof(char *), reinterpret_cast<uint8_t *>(s_rx_staging_free_queue_items), &s_rx_staging_free_queue_storage);
     s_rx_ready_queue = xQueueCreateStatic(
-        RX_STAGING_COUNT, sizeof(rx_item_t), reinterpret_cast<uint8_t *>(s_rx_ready_storage), &s_rx_ready_queue_storage);
+        RX_STAGING_COUNT, sizeof(rx_item_t), reinterpret_cast<uint8_t *>(s_rx_ready_queue_items), &s_rx_ready_queue_storage);
     s_rx_process_free_queue = xQueueCreateStatic(
-        RX_PROCESS_COUNT, sizeof(char *), reinterpret_cast<uint8_t *>(s_rx_process_free_storage), &s_rx_process_free_storage);
+        RX_PROCESS_COUNT, sizeof(char *), reinterpret_cast<uint8_t *>(s_rx_process_free_queue_items), &s_rx_process_free_queue_storage);
     if (!s_rx_staging_free_queue || !s_rx_ready_queue || !s_rx_process_free_queue) {
         ESP_LOGE(TAG, "WS_RX: gagal membuat RX queues");
         return false;
@@ -208,7 +200,8 @@ static bool ensure_rx_worker(void)
                 if (xQueueReceive(s_rx_process_free_queue, &process_buffer, 0) != pdPASS || !process_buffer) {
                     metric_inc(&s_rx_payload_drops);
                     const uint32_t drops = __atomic_load_n(&s_rx_payload_drops, __ATOMIC_RELAXED);
-                    if (drops - __atomic_load_n(&s_rx_last_starvation_log, __ATOMIC_RELAXED) >= 8U) {
+                    const uint32_t last = __atomic_load_n(&s_rx_last_starvation_log, __ATOMIC_RELAXED);
+                    if (drops - last >= 8U) {
                         __atomic_store_n(&s_rx_last_starvation_log, drops, __ATOMIC_RELAXED);
                         ESP_LOGW(TAG, "WS_RX: processing pool empty; payload dropped total=%lu", (unsigned long)drops);
                     }
@@ -217,9 +210,7 @@ static bool ensure_rx_worker(void)
                 }
                 note_process_free_depth();
 
-                const int64_t copy_start_us = esp_timer_get_time();
                 memcpy(process_buffer, item.buffer, item.len + 1U);
-                const int64_t copy_done_us = esp_timer_get_time();
                 (void)return_buffer(s_rx_staging_free_queue, &item.buffer, "staging");
                 item.buffer = nullptr;
 
@@ -232,10 +223,7 @@ static bool ensure_rx_worker(void)
                     metric_inc(&s_rx_processing_count);
                     (void)gemini_protocol_process_message(process_buffer, item.len, item.generation);
                 }
-                const uint32_t processing_us = (uint32_t)(esp_timer_get_time() - process_start_us);
-                metric_max(&s_rx_processing_max_us, processing_us);
-                (void)copy_start_us;
-                (void)copy_done_us;
+                metric_max(&s_rx_processing_max_us, (uint32_t)(esp_timer_get_time() - process_start_us));
 
                 if (!return_buffer(s_rx_process_free_queue, &process_buffer, "processing")) {
                     ESP_LOGE(TAG, "WS_RX: processing buffer lost");
@@ -272,16 +260,14 @@ static void reset_rx(void)
     s_rx_discarding = false;
     s_rx_discard_expected = 0;
     s_rx_discard_received = 0;
-    s_rx_discard_generation = 0;
     note_staging_depth();
 }
 
-static void begin_discard(size_t payload_len, uint32_t generation)
+static void begin_discard(size_t payload_len)
 {
     s_rx_discarding = true;
     s_rx_discard_expected = payload_len;
     s_rx_discard_received = 0;
-    s_rx_discard_generation = generation;
 }
 
 static void handle_data_event(esp_websocket_event_data_t *event)
@@ -292,8 +278,7 @@ static void handle_data_event(esp_websocket_event_data_t *event)
     metric_inc(&s_rx_chunks);
     metric_add_u64(&s_rx_bytes, (uint64_t)event->data_len);
 
-    const uint8_t raw_opcode = event->op_code;
-    const uint8_t opcode = raw_opcode & 0x0FU;
+    const uint8_t opcode = event->op_code & 0x0FU;
     const size_t payload_len = (size_t)event->payload_len;
     const size_t payload_offset = (size_t)event->payload_offset;
     const size_t data_len = (size_t)event->data_len;
@@ -302,6 +287,7 @@ static void handle_data_event(esp_websocket_event_data_t *event)
         ESP_LOGW(TAG, "WS_RX: invalid boundary total=%u offset=%u len=%u", (unsigned)payload_len, (unsigned)payload_offset, (unsigned)data_len);
         reset_rx();
         metric_inc(&s_rx_fragment_errors);
+        metric_max(&s_rx_callback_max_us, (uint32_t)(esp_timer_get_time() - callback_start_us));
         return;
     }
     if (opcode == 0x8U || opcode == 0x9U || opcode == 0xAU) return;
@@ -309,12 +295,14 @@ static void handle_data_event(esp_websocket_event_data_t *event)
         ESP_LOGW(TAG, "WS_RX: unsupported opcode=0x%02X dropped", opcode);
         reset_rx();
         metric_inc(&s_rx_fragment_errors);
+        metric_max(&s_rx_callback_max_us, (uint32_t)(esp_timer_get_time() - callback_start_us));
         return;
     }
     if (!ensure_rx_worker()) {
         ESP_LOGW(TAG, "WS_RX: RX worker unavailable; payload dropped");
         reset_rx();
         metric_inc(&s_rx_payload_drops);
+        metric_max(&s_rx_callback_max_us, (uint32_t)(esp_timer_get_time() - callback_start_us));
         return;
     }
 
@@ -322,16 +310,19 @@ static void handle_data_event(esp_websocket_event_data_t *event)
         reset_rx();
         if (opcode != 0x01U && opcode != 0x02U) {
             metric_inc(&s_rx_fragment_errors);
+            metric_max(&s_rx_callback_max_us, (uint32_t)(esp_timer_get_time() - callback_start_us));
             return;
         }
         if (xQueueReceive(s_rx_staging_free_queue, &s_rx_assembling_buffer, 0) != pdPASS) {
             metric_inc(&s_rx_payload_drops);
-            begin_discard(payload_len, websocket_transport_generation());
+            begin_discard(payload_len);
             const uint32_t drops = __atomic_load_n(&s_rx_payload_drops, __ATOMIC_RELAXED);
-            if (drops - __atomic_load_n(&s_rx_last_starvation_log, __ATOMIC_RELAXED) >= 8U) {
+            const uint32_t last = __atomic_load_n(&s_rx_last_starvation_log, __ATOMIC_RELAXED);
+            if (drops - last >= 8U) {
                 __atomic_store_n(&s_rx_last_starvation_log, drops, __ATOMIC_RELAXED);
                 ESP_LOGW(TAG, "WS_RX: staging pool empty; payload dropped total=%lu", (unsigned long)drops);
             }
+            metric_max(&s_rx_callback_max_us, (uint32_t)(esp_timer_get_time() - callback_start_us));
             return;
         }
         note_staging_depth();
@@ -347,10 +338,7 @@ static void handle_data_event(esp_websocket_event_data_t *event)
                 s_rx_discarding = false;
                 s_rx_discard_expected = 0;
                 s_rx_discard_received = 0;
-                s_rx_discard_generation = 0;
             }
-        } else {
-            /* Ignore the remainder of a failed message. Do not cascade logs. */
         }
         metric_max(&s_rx_callback_max_us, (uint32_t)(esp_timer_get_time() - callback_start_us));
         return;
@@ -359,6 +347,7 @@ static void handle_data_event(esp_websocket_event_data_t *event)
         if (!s_rx_assembling || s_rx_expected != payload_len || payload_offset != s_rx_received || !opcode_matches_message) {
             metric_inc(&s_rx_fragment_errors);
             reset_rx();
+            metric_max(&s_rx_callback_max_us, (uint32_t)(esp_timer_get_time() - callback_start_us));
             return;
         }
     }
