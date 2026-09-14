@@ -31,4 +31,5 @@ target_link_options(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=audio_read_mic"
     "-Wl,--wrap=i2s_channel_read"
     "-Wl,--wrap=aec_process"
+    "-Wl,--wrap=xQueueGenericSend"
 )
