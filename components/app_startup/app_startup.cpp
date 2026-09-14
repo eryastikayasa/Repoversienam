@@ -100,17 +100,22 @@ extern "C" void app_startup_run(void)
     ESP_LOGI(TAG, "Repo6 startup: app_startup_run()");
     log_main_task_audit("boot");
 
+    /* Repo6 startup architecture remains intact; only the OLED presentation
+     * is initialized here before the system startup sequence continues. */
+    display_engine_init();
+    display_engine_start();
+    display_set_system_state(FACE_IDLE, "Memulai...");
+
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         if (nvs_flash_erase() == ESP_OK) nvs_err = nvs_flash_init();
     }
     if (nvs_err != ESP_OK) {
+        display_set_system_state(FACE_ERROR, "NVS gagal");
         ESP_LOGE(TAG, "NVS init gagal: %s", esp_err_to_name(nvs_err));
         return;
     }
 
-    display_engine_init();
-    display_engine_start();
     uart_control_init();
 
     if (web_config_is_needed()) {
@@ -122,19 +127,37 @@ extern "C" void app_startup_run(void)
     audio_hal_init();
     audio_hal_ns_init();
     audio_engine_log_diagnostics("boot_audio_ready");
-    if (!audio_engine_init()) return;
+    if (!audio_engine_init()) {
+        display_set_system_state(FACE_ERROR, "Audio gagal");
+        return;
+    }
 
+    display_set_system_state(FACE_IDLE, "WiFi...");
     wifi_init_sta();
-    if (!wifi_wait_for_connection(30000)) return;
+    if (!wifi_wait_for_connection(30000)) {
+        display_set_system_state(FACE_ERROR, "WiFi gagal");
+        return;
+    }
     esp_wifi_set_ps(WIFI_PS_NONE);
+    display_set_system_state(FACE_IDLE, "WiFi OK");
     audio_engine_log_diagnostics("wifi_ready");
     log_main_task_audit("wifi_ready");
 
-    if (!wakeword_init()) return;
-    if (!wakeword_start(on_wakeword_detected, nullptr)) return;
-    if (!audio_engine_mic_capture_active() && !audio_engine_start_capture()) return;
+    if (!wakeword_init()) {
+        display_set_system_state(FACE_ERROR, "WakeWord gagal");
+        return;
+    }
+    if (!wakeword_start(on_wakeword_detected, nullptr)) {
+        display_set_system_state(FACE_ERROR, "WakeWord gagal");
+        return;
+    }
+    if (!audio_engine_mic_capture_active() && !audio_engine_start_capture()) {
+        display_set_system_state(FACE_ERROR, "MIC gagal");
+        return;
+    }
     boot_button_init();
 
+    display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
     ESP_LOGI(TAG, "SISTEM SIAP: Web Config -> NVS -> WiFi -> Wake Word");
     ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
     ESP_LOGI(TAG, "BOOT button aktif: GPIO0");
@@ -146,17 +169,22 @@ extern "C" void app_startup_run(void)
 
         if (s_assistant_requested && !websocket_is_connected()) {
             s_assistant_requested = false;
+            display_set_system_state(FACE_LISTENING, "Menghubungkan Gemini...");
             ESP_LOGI(TAG, "Trigger -> hentikan WakeWord dan lepaskan MIC");
             (void)wakeword_stop();
             if (!audio_engine_stop_capture_and_wait()) {
                 ESP_LOGE(TAG, "MIC ownership transition gagal -> WakeWord");
+                display_set_system_state(FACE_ERROR, "MIC gagal");
                 (void)wakeword_rearm();
+                display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
             if (!audio_engine_prepare_gemini_input()) {
                 ESP_LOGE(TAG, "MIC ownership Gemini gagal -> WakeWord");
+                display_set_system_state(FACE_ERROR, "MIC gagal");
                 (void)wakeword_rearm();
+                display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
@@ -165,7 +193,9 @@ extern "C" void app_startup_run(void)
             websocket_init();
             if (!websocket_connect()) {
                 ESP_LOGW(TAG, "WebSocket Gemini gagal -> Wake Word");
+                display_set_system_state(FACE_ERROR, "Gemini gagal");
                 (void)wakeword_rearm();
+                display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
@@ -174,19 +204,24 @@ extern "C" void app_startup_run(void)
         if (!websocket_is_connected() && websocket_take_resume_request()) {
             ESP_LOGW(TAG, "Gemini GoAway: mencoba session resumption (timeLeft=%llums)",
                      (unsigned long long)websocket_goaway_time_left_ms());
+            display_set_system_state(FACE_LISTENING, "Menghubungkan Gemini...");
             (void)wakeword_stop();
             if (!audio_engine_stop_capture_and_wait() || !audio_engine_prepare_gemini_input()) {
                 ESP_LOGE(TAG, "MIC ownership transition gagal untuk session resumption -> Wake Word");
+                display_set_system_state(FACE_ERROR, "MIC gagal");
                 s_session_was_connected = false;
                 s_assistant_requested = false;
                 (void)wakeword_rearm();
+                display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
                 continue;
             }
             if (!websocket_connect()) {
                 ESP_LOGW(TAG, "Session resumption gagal -> Wake Word");
+                display_set_system_state(FACE_ERROR, "Gemini gagal");
                 s_session_was_connected = false;
                 s_assistant_requested = false;
                 (void)wakeword_rearm();
+                display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
             }
         }
 
@@ -204,8 +239,10 @@ extern "C" void app_startup_run(void)
             audio_engine_stop_input_session();
             if (!audio_engine_stop_capture_and_wait()) {
                 ESP_LOGE(TAG, "MIC Gemini gagal dilepas saat sesi selesai");
+                display_set_system_state(FACE_ERROR, "MIC gagal");
             }
             (void)wakeword_rearm();
+            display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
             audio_engine_log_diagnostics("gemini_disconnected");
         }
 
