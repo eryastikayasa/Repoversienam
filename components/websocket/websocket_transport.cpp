@@ -63,7 +63,8 @@ esp_err_t websocket_transport_connect(void)
     cfg.disable_auto_reconnect = true;
     cfg.task_stack = 4096;
     cfg.task_prio = 4;
-    cfg.task_core = 0;
+    cfg.task_core_id_set = true;
+    cfg.task_core_id = 0;
     cfg.buffer_size = 8192;
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) {
