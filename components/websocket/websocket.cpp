@@ -9,6 +9,7 @@
 
 static const char *TAG = "WEBSOCKET";
 static bool s_initialized = false;
+static bool s_intentional_session_end = false;
 static constexpr TickType_t CONNECT_WAIT_TICKS = pdMS_TO_TICKS(15000);
 
 void websocket_init(void)
@@ -23,6 +24,7 @@ void websocket_init(void)
 bool websocket_connect(void)
 {
     if (!s_initialized) websocket_init();
+    s_intentional_session_end = false;
     if (websocket_transport_connect() != ESP_OK) return false;
     const TickType_t started = xTaskGetTickCount();
     while (!websocket_transport_is_connected()) {
@@ -42,8 +44,8 @@ void websocket_disconnect(void)
 
 void websocket_end_session(void)
 {
+    s_intentional_session_end = true;
     ESP_LOGI(TAG, "WS: ending current Gemini session (intentional)");
-    gemini_protocol_request_intentional_end();
     (void)websocket_transport_disconnect();
 }
 
@@ -70,11 +72,12 @@ bool websocket_setup_complete(void)
 
 bool websocket_should_resume(void)
 {
-    return gemini_protocol_should_resume();
+    return !s_intentional_session_end && gemini_protocol_should_resume();
 }
 
 bool websocket_take_resume_request(void)
 {
+    if (s_intentional_session_end) return false;
     return gemini_protocol_take_resume_request();
 }
 
