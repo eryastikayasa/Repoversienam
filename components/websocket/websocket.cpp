@@ -40,6 +40,13 @@ void websocket_disconnect(void)
     (void)websocket_transport_disconnect();
 }
 
+void websocket_end_session(void)
+{
+    ESP_LOGI(TAG, "WS: ending current Gemini session (intentional)");
+    gemini_protocol_request_intentional_end();
+    (void)websocket_transport_disconnect();
+}
+
 bool websocket_is_connected(void)
 {
     return websocket_transport_is_connected();
