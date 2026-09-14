@@ -13,10 +13,9 @@
 
 namespace {
 
-// The existing display task remains the single renderer. 25 FPS gives the
-// face enough temporal resolution for natural blink/gaze/mouth motion without
-// creating another task or changing any realtime audio task.
-constexpr int DISPLAY_ENGINE_FRAME_MS = 40;
+// Keep the existing single display task. 20 FPS is a conservative cadence for
+// smoother face animation without unnecessarily increasing OLED/I2C pressure.
+constexpr int DISPLAY_ENGINE_FRAME_MS = 50;
 constexpr int DISPLAY_ENGINE_WIDTH = DISPLAY_DRIVER_WIDTH;
 constexpr int DISPLAY_ENGINE_HEIGHT = DISPLAY_DRIVER_HEIGHT;
 constexpr size_t DISPLAY_FRAMEBUFFER_SIZE =
