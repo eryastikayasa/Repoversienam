@@ -12,6 +12,7 @@ extern "C" {
 esp_err_t websocket_transport_init(void);
 esp_err_t websocket_transport_connect(void);
 esp_err_t websocket_transport_disconnect(void);
+esp_err_t websocket_transport_abort(void);
 bool websocket_transport_is_connected(void);
 esp_websocket_client_handle_t websocket_transport_client(void);
 uint32_t websocket_transport_generation(void);
