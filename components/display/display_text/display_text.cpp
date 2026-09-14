@@ -10,20 +10,24 @@ namespace {
 
 constexpr int OLED_WIDTH = 128;
 constexpr int OLED_HEIGHT = 64;
-constexpr uint32_t TEXT_SCROLL_STEP_MS = 33;
+constexpr uint32_t TEXT_TYPE_INTERVAL_MS = 55;
+constexpr uint32_t TEXT_STATUS_SCROLL_STEP_MS = 33;
 constexpr size_t TRANSCRIPT_TEXT_CAP = 512;
 
 static EXT_RAM_BSS_ATTR uint8_t s_text_buffer[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
-static char s_user_scroll_text[TRANSCRIPT_TEXT_CAP] = {0};
-static char s_gemini_scroll_text[TRANSCRIPT_TEXT_CAP] = {0};
+static char s_user_target[TRANSCRIPT_TEXT_CAP] = {0};
+static char s_gemini_target[TRANSCRIPT_TEXT_CAP] = {0};
 static char s_status_text[64] = {0};
 static char s_user_render_copy[TRANSCRIPT_TEXT_CAP] = {0};
 static char s_gemini_render_copy[TRANSCRIPT_TEXT_CAP] = {0};
+static uint16_t s_user_visible_len = 0;
+static uint16_t s_gemini_visible_len = 0;
 static uint16_t s_user_scroll_offset = 0;
 static uint16_t s_gemini_scroll_offset = 0;
 static uint16_t s_status_scroll_offset = 0;
-static uint32_t s_last_update_ms = 0;
-static portMUX_TYPE s_scroll_text_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_last_type_ms = 0;
+static uint32_t s_last_status_update_ms = 0;
+static portMUX_TYPE s_text_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint8_t text_glyph_row(char c, int row)
 {
@@ -79,61 +83,75 @@ static void draw_text_char(int x, int y, char c)
     }
 }
 
-static void draw_scrolling_text(const char *text, uint16_t offset, int text_x)
+static void draw_text_window(const char *text, uint16_t visible_len, int text_x)
 {
-    if (!text || !text[0]) return;
+    if (!text || visible_len == 0) return;
     constexpr int TEXT_Y = OLED_HEIGHT - 5;
     constexpr int CHAR_WIDTH = 6;
     constexpr int TEXT_RIGHT = OLED_WIDTH - 1;
-    constexpr int GAP_PX = 12;
-    const size_t len = strlen(text);
-    const int text_px = (int)len * CHAR_WIDTH;
     const int visible_width = TEXT_RIGHT - text_x + 1;
-    if (visible_width <= 5) return;
-    if (text_px <= visible_width) {
-        for (size_t i = 0; i < len; ++i) draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[i]);
-        return;
-    }
-    const int cycle_px = text_px + GAP_PX;
-    int pos = TEXT_RIGHT + 1 - (int)offset;
-    for (size_t i = 0; i < len; ++i) {
-        const int x = pos + (int)i * CHAR_WIDTH;
-        if (x + 5 >= text_x && x <= TEXT_RIGHT) draw_text_char(x, TEXT_Y, text[i]);
-    }
-    pos += cycle_px;
-    for (size_t i = 0; i < len; ++i) {
-        const int x = pos + (int)i * CHAR_WIDTH;
-        if (x + 5 >= text_x && x <= TEXT_RIGHT) draw_text_char(x, TEXT_Y, text[i]);
+    if (visible_width < 6) return;
+
+    const int max_chars = visible_width / CHAR_WIDTH;
+    const size_t len = strlen(text);
+    const size_t count = visible_len < len ? visible_len : len;
+    if (count == 0) return;
+
+    size_t first = 0;
+    if ((int)count > max_chars) first = count - (size_t)max_chars;
+
+    const size_t draw_count = count - first;
+    for (size_t i = 0; i < draw_count; ++i) {
+        draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[first + i]);
     }
 }
 
-static void set_scroll_text(char *dst, size_t dst_size, const char *text, uint16_t &offset)
+static void set_target_text(char *dst, size_t dst_size, const char *text, uint16_t &visible_len)
 {
     if (!dst || dst_size == 0) return;
-    dst[0] = '\0';
-    offset = 0;
-    if (!text) return;
-    size_t out = 0;
-    for (size_t i = 0; text[i] != '\0' && out + 1 < dst_size; ++i) {
-        unsigned char c = (unsigned char)text[i];
-        if (c >= 0x20 && c <= 0x7E) dst[out++] = (char)c;
+
+    char sanitized[TRANSCRIPT_TEXT_CAP] = {0};
+    if (text) {
+        size_t out = 0;
+        for (size_t i = 0; text[i] != '\0' && out + 1 < sizeof(sanitized); ++i) {
+            const unsigned char c = (unsigned char)text[i];
+            if (c >= 0x20 && c <= 0x7E) sanitized[out++] = (char)c;
+        }
+        sanitized[out] = '\0';
     }
-    dst[out] = '\0';
+
+    const size_t old_len = strlen(dst);
+    const size_t new_len = strlen(sanitized);
+    if (old_len == new_len && strcmp(dst, sanitized) == 0) return;
+
+    size_t common = 0;
+    while (common < old_len && common < new_len && dst[common] == sanitized[common]) ++common;
+
+    size_t current_visible = visible_len;
+    if (current_visible > old_len) current_visible = old_len;
+    if (current_visible > common) current_visible = common;
+
+    memcpy(dst, sanitized, new_len + 1U);
+    visible_len = (uint16_t)current_visible;
 }
 
-static void append_scroll_text(char *dst, size_t dst_size, const char *text)
+static void reset_typing_state(char *target, uint16_t &visible_len, const char *text)
 {
-    if (!dst || dst_size == 0 || !text || !text[0]) return;
-    size_t out = strlen(dst);
-    if (out > 0 && out + 1 < dst_size) {
-        dst[out++] = ' ';
-        dst[out] = '\0';
-    }
-    for (size_t i = 0; text[i] != '\0' && out + 1 < dst_size; ++i) {
-        unsigned char c = (unsigned char)text[i];
-        if (c >= 0x20 && c <= 0x7E) dst[out++] = (char)c;
-    }
-    dst[out] = '\0';
+    target[0] = '\0';
+    visible_len = 0;
+    set_target_text(target, TRANSCRIPT_TEXT_CAP, text, visible_len);
+}
+
+static uint16_t advance_status_offset(const char *text, uint16_t offset, uint32_t steps)
+{
+    if (!text || !text[0]) return 0;
+    constexpr uint16_t CHAR_WIDTH = 6;
+    constexpr uint16_t GAP_PX = 12;
+    const uint32_t text_px = (uint32_t)strlen(text) * CHAR_WIDTH;
+    const uint32_t visible_width = OLED_WIDTH - 4;
+    if (text_px <= visible_width) return 0;
+    const uint32_t cycle_px = text_px + GAP_PX;
+    return (uint16_t)((offset + steps) % cycle_px);
 }
 
 static void draw_rssi_char(int x, int y, char c)
@@ -149,11 +167,11 @@ static void draw_rssi_char(int x, int y, char c)
     int index = (c == '-') ? 0 : (c - '0' + 1);
     if (index < 0 || index >= (int)(sizeof(glyphs) / sizeof(glyphs[0]))) return;
     for (int col = 0; col < 5; ++col) {
-        uint8_t bits = glyphs[index][col];
+        const uint8_t bits = glyphs[index][col];
         for (int row = 0; row < 5; ++row) {
             if (bits & (1U << row)) {
-                int px = x + col;
-                int py = y + row;
+                const int px = x + col;
+                const int py = y + row;
                 if (px >= 0 && px < OLED_WIDTH && py >= 0 && py < OLED_HEIGHT)
                     s_text_buffer[px + (py >> 3) * OLED_WIDTH] |= (uint8_t)(1U << (py & 7));
             }
@@ -170,7 +188,7 @@ static int draw_rssi(void)
     if (rssi < -99) rssi = -99;
     char text[5];
     snprintf(text, sizeof(text), "%d", rssi);
-    const int char_width = 6;
+    constexpr int char_width = 6;
     int x = 0;
     const int y = OLED_HEIGHT - 5;
     for (size_t i = 0; text[i] != '\0'; ++i) {
@@ -180,144 +198,167 @@ static int draw_rssi(void)
     return x;
 }
 
-static uint16_t advance_scroll_offset(const char *text, uint16_t offset, uint32_t steps)
-{
-    if (!text || !text[0]) return 0;
-    constexpr uint16_t CHAR_WIDTH = 6;
-    constexpr uint16_t GAP_PX = 12;
-    const uint32_t text_px = (uint32_t)strlen(text) * CHAR_WIDTH;
-    const uint32_t visible_width = OLED_WIDTH - 1 - 4 + 1;
-    if (text_px <= visible_width) return 0;
-    const uint32_t cycle_px = text_px + GAP_PX;
-    return (uint16_t)((offset + steps) % cycle_px);
-}
-
 }
 
 void display_text_init(void)
 {
-    portENTER_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
-    s_user_scroll_text[0] = '\0';
-    s_gemini_scroll_text[0] = '\0';
+    s_user_target[0] = '\0';
+    s_gemini_target[0] = '\0';
     s_status_text[0] = '\0';
     s_user_render_copy[0] = '\0';
     s_gemini_render_copy[0] = '\0';
+    s_user_visible_len = 0;
+    s_gemini_visible_len = 0;
     s_user_scroll_offset = 0;
     s_gemini_scroll_offset = 0;
     s_status_scroll_offset = 0;
-    s_last_update_ms = 0;
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    s_last_type_ms = 0;
+    s_last_status_update_ms = 0;
+    portEXIT_CRITICAL(&s_text_mux);
 }
 
 void display_text_update(uint32_t now_ms)
 {
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    if (s_last_update_ms == 0) {
-        s_last_update_ms = now_ms;
-        portEXIT_CRITICAL(&s_scroll_text_mux);
-        return;
+    portENTER_CRITICAL(&s_text_mux);
+
+    if (s_last_type_ms == 0) s_last_type_ms = now_ms;
+    const uint32_t type_elapsed = now_ms - s_last_type_ms;
+    if (type_elapsed >= TEXT_TYPE_INTERVAL_MS) {
+        if (s_user_visible_len < strlen(s_user_target)) ++s_user_visible_len;
+        if (s_gemini_visible_len < strlen(s_gemini_target)) ++s_gemini_visible_len;
+        s_last_type_ms = now_ms;
     }
-    const uint32_t elapsed_ms = now_ms - s_last_update_ms;
-    const uint32_t steps = elapsed_ms / TEXT_SCROLL_STEP_MS;
-    if (steps == 0) {
-        portEXIT_CRITICAL(&s_scroll_text_mux);
-        return;
+
+    if (s_last_status_update_ms == 0) s_last_status_update_ms = now_ms;
+    const uint32_t status_elapsed = now_ms - s_last_status_update_ms;
+    const uint32_t status_steps = status_elapsed / TEXT_STATUS_SCROLL_STEP_MS;
+    if (status_steps > 0) {
+        s_status_scroll_offset = advance_status_offset(s_status_text, s_status_scroll_offset, status_steps);
+        s_last_status_update_ms += status_steps * TEXT_STATUS_SCROLL_STEP_MS;
     }
-    s_user_scroll_offset = advance_scroll_offset(s_user_scroll_text, s_user_scroll_offset, steps);
-    s_gemini_scroll_offset = advance_scroll_offset(s_gemini_scroll_text, s_gemini_scroll_offset, steps);
-    s_status_scroll_offset = advance_scroll_offset(s_status_text, s_status_scroll_offset, steps);
-    s_last_update_ms += steps * TEXT_SCROLL_STEP_MS;
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+
+    portEXIT_CRITICAL(&s_text_mux);
 }
 
 void display_text_set_user(const char *text)
 {
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    set_scroll_text(s_user_scroll_text, sizeof(s_user_scroll_text), text, s_user_scroll_offset);
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
+    set_target_text(s_user_target, sizeof(s_user_target), text, s_user_visible_len);
+    s_user_scroll_offset = 0;
+    portEXIT_CRITICAL(&s_text_mux);
 }
 
 void display_text_set_gemini(const char *text)
 {
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    set_scroll_text(s_gemini_scroll_text, sizeof(s_gemini_scroll_text), text, s_gemini_scroll_offset);
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
+    set_target_text(s_gemini_target, sizeof(s_gemini_target), text, s_gemini_visible_len);
+    s_gemini_scroll_offset = 0;
+    portEXIT_CRITICAL(&s_text_mux);
 }
 
 void display_text_append_user(const char *text)
 {
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    append_scroll_text(s_user_scroll_text, sizeof(s_user_scroll_text), text);
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
+    const size_t old_len = strlen(s_user_target);
+    if (text && text[0] && old_len + 1U < sizeof(s_user_target)) {
+        if (s_user_target[old_len - (old_len > 0 ? 1 : 0)] != ' ') s_user_target[old_len++] = ' ';
+        size_t out = old_len;
+        for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_user_target); ++i) {
+            const unsigned char c = (unsigned char)text[i];
+            if (c >= 0x20 && c <= 0x7E) s_user_target[out++] = (char)c;
+        }
+        s_user_target[out] = '\0';
+    }
+    portEXIT_CRITICAL(&s_text_mux);
 }
 
 void display_text_append_gemini(const char *text)
 {
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    append_scroll_text(s_gemini_scroll_text, sizeof(s_gemini_scroll_text), text);
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
+    const size_t old_len = strlen(s_gemini_target);
+    if (text && text[0] && old_len + 1U < sizeof(s_gemini_target)) {
+        size_t out = old_len;
+        if (out > 0 && s_gemini_target[out - 1] != ' ') s_gemini_target[out++] = ' ';
+        for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_gemini_target); ++i) {
+            const unsigned char c = (unsigned char)text[i];
+            if (c >= 0x20 && c <= 0x7E) s_gemini_target[out++] = (char)c;
+        }
+        s_gemini_target[out] = '\0';
+    }
+    portEXIT_CRITICAL(&s_text_mux);
 }
 
 void display_text_set_status(const char *text)
 {
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    set_scroll_text(s_status_text, sizeof(s_status_text), text, s_status_scroll_offset);
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
+    size_t out = 0;
+    if (text) {
+        for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_status_text); ++i) {
+            const unsigned char c = (unsigned char)text[i];
+            if (c >= 0x20 && c <= 0x7E) s_status_text[out++] = (char)c;
+        }
+    }
+    s_status_text[out] = '\0';
+    s_status_scroll_offset = 0;
+    portEXIT_CRITICAL(&s_text_mux);
 }
 
 bool display_text_has_user(void)
 {
     bool has_text;
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    has_text = s_user_scroll_text[0] != '\0';
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
+    has_text = s_user_target[0] != '\0';
+    portEXIT_CRITICAL(&s_text_mux);
     return has_text;
 }
 
 bool display_text_has_gemini(void)
 {
     bool has_text;
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    has_text = s_gemini_scroll_text[0] != '\0';
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    portENTER_CRITICAL(&s_text_mux);
+    has_text = s_gemini_target[0] != '\0';
+    portEXIT_CRITICAL(&s_text_mux);
     return has_text;
 }
 
 void display_text_render_user(void)
 {
-    uint16_t offset = 0;
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    memcpy(s_user_render_copy, s_user_scroll_text, sizeof(s_user_render_copy));
-    offset = s_user_scroll_offset;
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    uint16_t visible_len = 0;
+    portENTER_CRITICAL(&s_text_mux);
+    memcpy(s_user_render_copy, s_user_target, sizeof(s_user_render_copy));
+    visible_len = s_user_visible_len;
+    portEXIT_CRITICAL(&s_text_mux);
     s_user_render_copy[sizeof(s_user_render_copy) - 1] = '\0';
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
-    draw_scrolling_text(s_user_render_copy, offset, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
+    draw_text_window(s_user_render_copy, visible_len, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
 }
 
 void display_text_render_gemini(void)
 {
-    uint16_t offset = 0;
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    memcpy(s_gemini_render_copy, s_gemini_scroll_text, sizeof(s_gemini_render_copy));
-    offset = s_gemini_scroll_offset;
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    uint16_t visible_len = 0;
+    portENTER_CRITICAL(&s_text_mux);
+    memcpy(s_gemini_render_copy, s_gemini_target, sizeof(s_gemini_render_copy));
+    visible_len = s_gemini_visible_len;
+    portEXIT_CRITICAL(&s_text_mux);
     s_gemini_render_copy[sizeof(s_gemini_render_copy) - 1] = '\0';
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
-    draw_scrolling_text(s_gemini_render_copy, offset, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
+    draw_text_window(s_gemini_render_copy, visible_len, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
 }
 
 void display_text_render_status(void)
 {
     char text[64] = {0};
-    portENTER_CRITICAL(&s_scroll_text_mux);
+    uint16_t offset = 0;
+    portENTER_CRITICAL(&s_text_mux);
     memcpy(text, s_status_text, sizeof(text));
-    portEXIT_CRITICAL(&s_scroll_text_mux);
+    offset = s_status_scroll_offset;
+    portEXIT_CRITICAL(&s_text_mux);
     text[sizeof(text) - 1] = '\0';
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
@@ -325,10 +366,21 @@ void display_text_render_status(void)
     constexpr int TEXT_Y = OLED_HEIGHT - 5;
     const size_t len = strlen(text);
     const int max_chars = OLED_WIDTH / CHAR_WIDTH;
-    const int chars_to_draw = len < (size_t)max_chars ? (int)len : max_chars;
-    int x = (OLED_WIDTH - chars_to_draw * CHAR_WIDTH) / 2;
-    if (x < 0) x = 0;
-    for (int i = 0; i < chars_to_draw; ++i) draw_text_char(x + i * CHAR_WIDTH, TEXT_Y, text[i]);
+    if (len == 0) return;
+
+    if ((int)len <= max_chars) {
+        const int x = (OLED_WIDTH - (int)len * CHAR_WIDTH) / 2;
+        for (size_t i = 0; i < len; ++i) draw_text_char(x + (int)i * CHAR_WIDTH, TEXT_Y, text[i]);
+        return;
+    }
+
+    const int text_px = (int)len * CHAR_WIDTH;
+    int x = OLED_WIDTH - (int)offset;
+    for (size_t i = 0; i < len; ++i) {
+        const int px = x + (int)i * CHAR_WIDTH;
+        if (px + 5 >= 0 && px < OLED_WIDTH) draw_text_char(px, TEXT_Y, text[i]);
+    }
+    (void)text_px;
 }
 
 const uint8_t *display_text_buffer(void)
