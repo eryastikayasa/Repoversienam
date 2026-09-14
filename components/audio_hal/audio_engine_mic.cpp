@@ -156,7 +156,7 @@ static void log_mic_task_audit(const char *stage)
 static void sink_task(void *arg)
 {
     (void)arg;
-    uint8_t frame[MIC_FRAME_BYTES];
+    static uint8_t frame[MIC_FRAME_BYTES];
     ESP_LOGI(TAG, "Mic transport worker aktif; queue=%ums, frame=%uB",
              (unsigned)(MIC_TX_QUEUE_DEPTH * 20U), (unsigned)MIC_FRAME_BYTES);
     for (;;) {
