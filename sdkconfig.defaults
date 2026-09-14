@@ -26,3 +26,8 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
 # send/receive traffic. This is important for full-duplex Gemini audio.
 CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
 CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000
+
+# Realtime Gemini audio uses small, frequent TLS writes. Enable TCP_NODELAY
+# to avoid Nagle/delayed-ACK latency spikes on these small WebSocket frames.
+# ESP-TLS applies TCP_NODELAY to the underlying socket when this option is set.
+CONFIG_ESP_TLS_ENABLE_TCP_NODELAY=y
