@@ -15,8 +15,8 @@ static bool s_initialized = false;
 static uint32_t s_generation = 0;
 
 /* Match Repo3's proven audio TX timing: 3000 ms write budget, one retry,
- * 30 ms retry delay. A transient writable-transport stall must not kill the
- * whole Gemini WebSocket session. */
+ * 30 ms retry delay. Both the current direct mic_tx sender and the historical
+ * mic_net_tx sender use this profile; normal control messages stay at 2000 ms. */
 static constexpr TickType_t MIC_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
 static constexpr TickType_t NORMAL_SEND_TIMEOUT = pdMS_TO_TICKS(2000);
 static constexpr TickType_t MIC_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
@@ -51,9 +51,19 @@ esp_err_t websocket_transport_connect(void)
     char url[URL_MAX] = {0};
     if (!build_server_url(url, sizeof(url))) return ESP_ERR_INVALID_ARG;
     esp_websocket_client_config_t cfg = {};
-    cfg.uri = url; cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.network_timeout_ms = 15000; cfg.reconnect_timeout_ms = 5000;
-    cfg.disable_auto_reconnect = true; cfg.task_stack = 4096; cfg.buffer_size = 8192;
+    cfg.uri = url;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.skip_cert_common_name_check = false;
+    cfg.cert_common_name = "generativelanguage.googleapis.com";
+    cfg.network_timeout_ms = 15000;
+    cfg.reconnect_timeout_ms = 5000;
+    cfg.disable_auto_reconnect = true;
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = 30;
+    cfg.keep_alive_interval = 10;
+    cfg.keep_alive_count = 3;
+    cfg.task_stack = 4096;
+    cfg.buffer_size = 8192;
     s_client = esp_websocket_client_init(&cfg);
     if (!s_client) { ESP_LOGE(TAG, "esp_websocket_client_init gagal"); return ESP_FAIL; }
     esp_err_t err = esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, nullptr);
@@ -86,7 +96,8 @@ esp_err_t websocket_transport_send_text(const char *text, size_t len)
     if (!websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
 
     const char *task_name = pcTaskGetName(nullptr);
-    const bool mic_sender = task_name && strcmp(task_name, "mic_net_tx") == 0;
+    const bool mic_sender = task_name &&
+        (strcmp(task_name, "mic_tx") == 0 || strcmp(task_name, "mic_net_tx") == 0);
     const TickType_t timeout = mic_sender ? MIC_SEND_TIMEOUT : NORMAL_SEND_TIMEOUT;
     const int retries = mic_sender ? MIC_SEND_RETRIES : 0;
 
@@ -105,7 +116,7 @@ esp_err_t websocket_transport_send_text(const char *text, size_t len)
     }
 
     if (mic_sender) {
-        ESP_LOGW(TAG, "MIC_NET_TX send failed after retry; preserving WebSocket session");
+        ESP_LOGW(TAG, "MIC TX send failed after retry; preserving WebSocket session");
         return ESP_ERR_TIMEOUT;
     }
     return ESP_FAIL;
