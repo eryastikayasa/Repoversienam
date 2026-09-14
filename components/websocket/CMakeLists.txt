@@ -21,11 +21,14 @@ idf_component_register(
         cjson
 )
 
-# Diagnostic-only linker wrappers for the synchronous WebSocket send path.
-# They measure the actual transport/TLS calls made by mic_tx without changing
-# the WebSocket or Audio Engine architecture.
+# Diagnostic-only linker wrappers. These measure the actual synchronous
+# transport/TLS and audio-capture stages without changing ownership, queue
+# depth, task priority, or core affinity.
 target_link_options(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=esp_transport_poll_write"
     "-Wl,--wrap=esp_transport_write"
     "-Wl,--wrap=esp_tls_conn_write"
+    "-Wl,--wrap=audio_read_mic"
+    "-Wl,--wrap=i2s_channel_read"
+    "-Wl,--wrap=aec_process"
 )
