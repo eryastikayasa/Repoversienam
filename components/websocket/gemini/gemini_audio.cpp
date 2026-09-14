@@ -1,25 +1,38 @@
 #include "gemini_audio.h"
 #include "audio_engine.h"
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mbedtls/base64.h"
-#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "GEMINI_AUDIO";
 
-bool gemini_audio_process_server_message(const char *json, size_t len, uint32_t generation)
-{
-    if (!json || len == 0) return false;
+// RX transport accepts up to 64 KiB JSON payloads. A base64 field cannot
+// decode to more than ceil(64 KiB * 3 / 4), plus a small safety margin.
+static constexpr size_t DECODE_BUFFER_BYTES = (64U * 1024U * 3U) / 4U + 4U;
+static uint8_t *s_decode_buffer = nullptr;
 
-    cJSON *root = cJSON_ParseWithLength(json, len);
+static bool ensure_decode_buffer()
+{
+    if (s_decode_buffer) return true;
+    s_decode_buffer = static_cast<uint8_t *>(
+        heap_caps_malloc(DECODE_BUFFER_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!s_decode_buffer) {
+        ESP_LOGE(TAG, "Reusable decode buffer allocation gagal: %u byte", (unsigned)DECODE_BUFFER_BYTES);
+        return false;
+    }
+    ESP_LOGI(TAG, "Reusable Base64 decode buffer siap: %u byte PSRAM", (unsigned)DECODE_BUFFER_BYTES);
+    return true;
+}
+
+static bool process_server_root(const cJSON *root, uint32_t generation)
+{
     if (!root) return false;
 
     cJSON *server = cJSON_GetObjectItemCaseSensitive(root, "serverContent");
-    if (!cJSON_IsObject(server)) {
-        cJSON_Delete(root);
-        return false;
-    }
+    if (!cJSON_IsObject(server)) return false;
 
     bool handled = false;
 
@@ -55,33 +68,34 @@ bool gemini_audio_process_server_message(const char *json, size_t len, uint32_t 
             }
 
             const size_t b64_len = strlen(encoded->valuestring);
-            const size_t capacity = (b64_len / 4U) * 3U + 4U;
-            uint8_t *pcm = static_cast<uint8_t *>(malloc(capacity));
-            if (!pcm) {
-                ESP_LOGE(TAG, "Decode buffer gagal: %u byte", (unsigned)capacity);
+            const size_t max_decoded = (b64_len / 4U) * 3U + 4U;
+            if (b64_len == 0 || max_decoded > DECODE_BUFFER_BYTES) {
+                ESP_LOGW(TAG, "Base64 chunk terlalu besar: b64=%u max_decoded=%u buffer=%u",
+                         (unsigned)b64_len, (unsigned)max_decoded, (unsigned)DECODE_BUFFER_BYTES);
                 continue;
             }
+            if (!ensure_decode_buffer()) continue;
 
+            const int64_t decode_start_us = esp_timer_get_time();
             size_t decoded_len = 0;
             const int rc = mbedtls_base64_decode(
-                pcm, capacity, &decoded_len,
+                s_decode_buffer, DECODE_BUFFER_BYTES, &decoded_len,
                 reinterpret_cast<const unsigned char *>(encoded->valuestring), b64_len);
-
-            ESP_LOGI(TAG,
-                     "GEMINI_AUDIO: mimeType=%s base64_len=%u decoded_pcm_bytes=%u pcm_samples=%u",
-                     mime_type, (unsigned)b64_len, (unsigned)decoded_len,
-                     (unsigned)(decoded_len / 2U));
+            const uint32_t decode_us = (uint32_t)(esp_timer_get_time() - decode_start_us);
 
             if (rc != 0 || decoded_len == 0 || (decoded_len & 1U) != 0) {
-                ESP_LOGW(TAG, "GEMINI_AUDIO: Base64/PCM16 invalid rc=%d decoded=%u",
-                         rc, (unsigned)decoded_len);
-                free(pcm);
+                ESP_LOGW(TAG, "GEMINI_AUDIO: Base64/PCM16 invalid rc=%d decoded=%u decode_us=%lu",
+                         rc, (unsigned)decoded_len, (unsigned long)decode_us);
                 continue;
             }
 
-            if (!audio_engine_push_model_audio(pcm, decoded_len, generation)) {
-                ESP_LOGW(TAG, "GEMINI_AUDIO: AudioEngine reject PCM bytes=%u",
-                         (unsigned)decoded_len);
+            const int64_t enqueue_start_us = esp_timer_get_time();
+            const bool queued = audio_engine_push_model_audio(s_decode_buffer, decoded_len, generation);
+            const uint32_t enqueue_us = (uint32_t)(esp_timer_get_time() - enqueue_start_us);
+
+            if (!queued) {
+                ESP_LOGW(TAG, "GEMINI_AUDIO: AudioEngine reject PCM bytes=%u decode_us=%lu enqueue_us=%lu",
+                         (unsigned)decoded_len, (unsigned long)decode_us, (unsigned long)enqueue_us);
             } else {
                 const audio_engine_turn_t *turn = audio_engine_get_turn();
                 if (turn && turn->bytes_queued == decoded_len) {
@@ -93,7 +107,6 @@ bool gemini_audio_process_server_message(const char *json, size_t len, uint32_t 
                 audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_AUDIO, generation);
                 handled = true;
             }
-            free(pcm);
         }
     }
 
@@ -107,6 +120,20 @@ bool gemini_audio_process_server_message(const char *json, size_t len, uint32_t 
         handled = true;
     }
 
+    return handled;
+}
+
+bool gemini_audio_process_server_root(const cJSON *root, uint32_t generation)
+{
+    return process_server_root(root, generation);
+}
+
+bool gemini_audio_process_server_message(const char *json, size_t len, uint32_t generation)
+{
+    if (!json || len == 0) return false;
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (!root) return false;
+    const bool handled = process_server_root(root, generation);
     cJSON_Delete(root);
     return handled;
 }
