@@ -13,7 +13,14 @@ static esp_websocket_client_handle_t s_client = nullptr;
 static volatile bool s_connected = false;
 static bool s_initialized = false;
 static uint32_t s_generation = 0;
-static constexpr TickType_t MIC_SEND_TIMEOUT = pdMS_TO_TICKS(20);
+
+/*
+ * Repo3's proven TX path gives esp_websocket_client_send_text() enough time
+ * to wait for transport writability. Repo6 previously used 20 ms here, which
+ * is shorter than the observed poll_write latency and caused send_text() to
+ * return 0 during normal MIC streaming.
+ */
+static constexpr TickType_t MIC_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
 static constexpr TickType_t NORMAL_SEND_TIMEOUT = pdMS_TO_TICKS(2000);
 static constexpr size_t API_KEY_MAX = 128;
 static constexpr size_t URL_MAX = 512;
