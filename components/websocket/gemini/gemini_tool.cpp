@@ -13,7 +13,6 @@ static constexpr size_t TOOL_QUEUE_LEN = 4U;
 static constexpr size_t TOOL_ID_MAX = 128U;
 static constexpr size_t TOOL_NAME_MAX = 64U;
 static constexpr size_t TOOL_COMMAND_MAX = 32U;
-static constexpr size_t TOOL_RESULT_MAX = 64U;
 static constexpr uint32_t TOOL_WORKER_STACK = 4096U;
 static constexpr UBaseType_t TOOL_WORKER_PRIORITY = 4U;
 
@@ -27,6 +26,92 @@ static QueueHandle_t s_tool_queue = nullptr;
 static StaticQueue_t s_tool_queue_storage;
 static uint8_t s_tool_queue_buffer[TOOL_QUEUE_LEN * sizeof(tool_job_t)];
 static TaskHandle_t s_tool_worker = nullptr;
+
+extern "C" esp_err_t __real_websocket_transport_send_text(const char *text, size_t len);
+
+static void add_device_control_tool(cJSON *setup)
+{
+    if (!cJSON_IsObject(setup)) return;
+
+    cJSON *tools = cJSON_AddArrayToObject(setup, "tools");
+    if (!tools) return;
+    cJSON *tool = cJSON_CreateObject();
+    cJSON *functions = cJSON_CreateArray();
+    cJSON *decl = cJSON_CreateObject();
+    if (!tool || !functions || !decl) {
+        cJSON_Delete(tool);
+        cJSON_Delete(functions);
+        cJSON_Delete(decl);
+        return;
+    }
+
+    cJSON_AddItemToObject(tool, "functionDeclarations", functions);
+    cJSON_AddStringToObject(decl, "name", "control_device");
+    cJSON_AddStringToObject(decl, "description",
+        "Mengontrol perangkat rumah melalui UART. Gunakan hanya untuk aksi perangkat dan tunggu hasil fungsi sebelum menjawab pengguna.");
+
+    cJSON *parameters = cJSON_CreateObject();
+    cJSON *properties = cJSON_CreateObject();
+    cJSON *command = cJSON_CreateObject();
+    cJSON *enum_values = cJSON_CreateArray();
+    cJSON *required = cJSON_CreateArray();
+    if (!parameters || !properties || !command || !enum_values || !required) {
+        cJSON_Delete(tool);
+        cJSON_Delete(decl);
+        cJSON_Delete(parameters);
+        cJSON_Delete(properties);
+        cJSON_Delete(command);
+        cJSON_Delete(enum_values);
+        cJSON_Delete(required);
+        return;
+    }
+
+    cJSON_AddStringToObject(parameters, "type", "OBJECT");
+    cJSON_AddItemToObject(parameters, "properties", properties);
+    cJSON_AddItemToObject(properties, "command", command);
+    cJSON_AddStringToObject(command, "type", "STRING");
+    cJSON_AddStringToObject(command, "description", "Satu command UART yang didukung.");
+
+    static const char *const commands[] = {
+        "r1", "r2", "r3", "r4",
+        "fan_pwr", "fan_speed", "fan_swing", "fan_mode",
+        "mp3_mode", "mp3_play", "mp3_eq",
+        "m_led", "m_mute", "m_musik", "m_cek",
+        "cek_suhu", "cek_cahaya"
+    };
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i)
+        cJSON_AddItemToArray(enum_values, cJSON_CreateString(commands[i]));
+    cJSON_AddItemToObject(command, "enum", enum_values);
+    cJSON_AddItemToArray(required, cJSON_CreateString("command"));
+    cJSON_AddItemToObject(parameters, "required", required);
+    cJSON_AddItemToObject(decl, "parameters", parameters);
+    cJSON_AddItemToArray(functions, decl);
+    cJSON_AddItemToArray(tools, tool);
+}
+
+extern "C" esp_err_t __wrap_websocket_transport_send_text(const char *text, size_t len)
+{
+    if (!text || len == 0) return __real_websocket_transport_send_text(text, len);
+
+    cJSON *root = cJSON_ParseWithLength(text, len);
+    if (!root) return __real_websocket_transport_send_text(text, len);
+
+    cJSON *setup = cJSON_GetObjectItemCaseSensitive(root, "setup");
+    if (!cJSON_IsObject(setup) || cJSON_GetObjectItemCaseSensitive(setup, "tools")) {
+        cJSON_Delete(root);
+        return __real_websocket_transport_send_text(text, len);
+    }
+
+    add_device_control_tool(setup);
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) return __real_websocket_transport_send_text(text, len);
+
+    const size_t payload_len = strlen(payload);
+    esp_err_t err = __real_websocket_transport_send_text(payload, payload_len);
+    cJSON_free(payload);
+    return err;
+}
 
 static bool ensure_tool_worker(void)
 {
@@ -142,10 +227,7 @@ extern "C" void gemini_tool_handle_call(const cJSON *tool_call)
         if (strlen(id->valuestring) >= TOOL_ID_MAX ||
             strlen(name->valuestring) >= TOOL_NAME_MAX ||
             strlen(command->valuestring) >= TOOL_COMMAND_MAX) {
-            ESP_LOGW(TAG, "toolCall field terlalu panjang; id=%u name=%u command=%u",
-                     (unsigned)strlen(id->valuestring),
-                     (unsigned)strlen(name->valuestring),
-                     (unsigned)strlen(command->valuestring));
+            ESP_LOGW(TAG, "toolCall field terlalu panjang");
             continue;
         }
 
