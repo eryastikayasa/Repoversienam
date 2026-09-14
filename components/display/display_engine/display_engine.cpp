@@ -39,25 +39,39 @@ static void overlay_text_buffer(void)
 {
     const uint8_t *text = display_text_buffer();
     if (!text) return;
-
-    for (size_t i = 0; i < sizeof(s_final_buffer); ++i) {
-        s_final_buffer[i] |= text[i];
-    }
+    for (size_t i = 0; i < sizeof(s_final_buffer); ++i) s_final_buffer[i] |= text[i];
 }
 
 static void update_text_layer(void)
 {
-    switch (display_face_get_state()) {
+    const face_state_t state = display_face_get_state();
+
+    // Transcript ownership is separate from face/status state. A state change
+    // must never manufacture or clear conversation text.
+    switch (state) {
         case FACE_LISTENING:
-            display_text_render_user();
+            if (display_text_has_user()) display_text_render_user();
+            else display_text_render_status();
+            break;
+
+        case FACE_THINKING:
+            if (display_text_has_user()) display_text_render_user();
+            else display_text_render_status();
             break;
 
         case FACE_SPEAKING:
-            display_text_render_gemini();
+            // Do not show a locally invented speaking string while output
+            // transcription is still pending. Keep the user transcript visible
+            // until the first real Gemini transcript arrives.
+            if (display_text_has_gemini()) display_text_render_gemini();
+            else if (display_text_has_user()) display_text_render_user();
+            else display_text_render_status();
             break;
 
         default:
-            display_text_render_status();
+            if (display_text_has_user()) display_text_render_user();
+            else if (display_text_has_gemini()) display_text_render_gemini();
+            else display_text_render_status();
             break;
     }
 }
@@ -66,16 +80,9 @@ static void compose_frame(void)
 {
     const uint8_t *face = display_face_buffer();
     const uint8_t *text = display_text_buffer();
-
     clear_final_frame();
-
-    if (face) {
-        memcpy(s_final_buffer, face, sizeof(s_final_buffer));
-    }
-
-    if (text) {
-        overlay_text_buffer();
-    }
+    if (face) memcpy(s_final_buffer, face, sizeof(s_final_buffer));
+    if (text) overlay_text_buffer();
 }
 
 static void log_display_audit(const char *stage)
@@ -120,7 +127,6 @@ static void display_engine_task(void *)
 
     while (s_running) {
         const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-
         display_face_update(now_ms);
         display_text_update(now_ms);
         update_text_layer();
@@ -138,7 +144,6 @@ static void display_engine_task(void *)
             log_display_audit("runtime");
         }
 
-        /* Keep a scheduler boundary even if the display driver returns quickly. */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DISPLAY_ENGINE_FRAME_MS));
     }
 
@@ -151,7 +156,6 @@ static void display_engine_task(void *)
 void display_engine_init(void)
 {
     if (s_initialized) return;
-
     clear_final_frame();
     display_driver_init();
     s_initialized = true;
@@ -159,14 +163,10 @@ void display_engine_init(void)
 
 void display_engine_start(void)
 {
-    if (!s_initialized) {
-        display_engine_init();
-    }
-
+    if (!s_initialized) display_engine_init();
     if (s_running || s_display_engine_task) return;
 
     s_running = true;
-
     BaseType_t result = xTaskCreatePinnedToCore(
         display_engine_task,
         "display_engine",
@@ -191,18 +191,9 @@ void display_engine_stop(void)
 
 void display_set_system_state(face_state_t face, const char *status)
 {
-    const char *text = status ? status : "";
+    // Status is UI metadata only. Conversation text is populated exclusively
+    // by Gemini input/output transcription handlers and is intentionally left
+    // untouched here.
     display_face_set_state(face);
-    display_text_set_status(text);
-
-    /* Repo6's renderer selects user/gemini layers for listening/speaking.
-     * Mirror the system status into the active layer so the status remains
-     * visible without adding another render task. */
-    display_text_set_user("");
-    display_text_set_gemini("");
-    if (face == FACE_LISTENING) {
-        display_text_set_user(text);
-    } else if (face == FACE_SPEAKING) {
-        display_text_set_gemini(text);
-    }
+    display_text_set_status(status ? status : "");
 }
