@@ -5,6 +5,7 @@
 #include "web_config.h"
 #include "audio_engine.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include <stdio.h>
@@ -176,9 +177,19 @@ void gemini_protocol_on_disconnected(void)
 bool gemini_protocol_process_message(const char *json, size_t len, uint32_t generation)
 {
     if (!json || len == 0) return false;
+
+    const int64_t parse_start_us = esp_timer_get_time();
     cJSON *root = cJSON_ParseWithLength(json, len);
-    if (!root) { ESP_LOGW(TAG, "Gemini RX JSON invalid len=%u", (unsigned)len); return false; }
-    const gemini_message_type_t type = gemini_message_classify(json, len);
+    const uint32_t parse_us = (uint32_t)(esp_timer_get_time() - parse_start_us);
+    if (!root) {
+        ESP_LOGW(TAG, "Gemini RX JSON invalid len=%u", (unsigned)len);
+        return false;
+    }
+
+    const int64_t classify_start_us = esp_timer_get_time();
+    const gemini_message_type_t type = gemini_message_classify_root(root);
+    const uint32_t classify_us = (uint32_t)(esp_timer_get_time() - classify_start_us);
+
     bool handled = true;
     switch (type) {
     case GEMINI_MESSAGE_SETUP:
@@ -190,7 +201,7 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
         }
         break;
     case GEMINI_MESSAGE_SERVER_CONTENT:
-        handled = gemini_audio_process_server_message(json, len, generation);
+        handled = gemini_audio_process_server_root(root, generation);
         break;
     case GEMINI_MESSAGE_SESSION_RESUMPTION: {
         cJSON *update = cJSON_GetObjectItemCaseSensitive(root, "sessionResumptionUpdate");
@@ -208,6 +219,7 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
     default:
         ESP_LOGW(TAG, "GEMINI_PROTO: message type unknown len=%u", (unsigned)len); handled = false; break;
     }
+
     if (s_greeting_sent && !s_greeting_finished && type == GEMINI_MESSAGE_SERVER_CONTENT) {
         cJSON *server = cJSON_GetObjectItemCaseSensitive(root, "serverContent");
         const bool done = cJSON_IsObject(server) &&
@@ -220,6 +232,33 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
             audio_engine_request_input_session_after_drain();
         }
     }
+
+    // Profiling is intentionally sampled, not logged for every audio chunk.
+    static int64_t last_profile_us = 0;
+    static uint64_t profile_count = 0;
+    static uint64_t profile_parse_us = 0;
+    static uint64_t profile_classify_us = 0;
+    static uint64_t profile_total_us = 0;
+    ++profile_count;
+    profile_parse_us += parse_us;
+    profile_classify_us += classify_us;
+    const int64_t profile_now_us = esp_timer_get_time();
+    if (!last_profile_us) last_profile_us = profile_now_us;
+    const uint32_t total_so_far_us = (uint32_t)(profile_now_us - (profile_now_us - parse_us));
+    profile_total_us += total_so_far_us;
+    if (profile_now_us - last_profile_us >= 5000000LL) {
+        ESP_LOGI(TAG, "RX_PROFILE: count=%llu json=%llu us avg classify=%llu us avg total=%llu us avg",
+                 (unsigned long long)profile_count,
+                 (unsigned long long)(profile_parse_us / profile_count),
+                 (unsigned long long)(profile_classify_us / profile_count),
+                 (unsigned long long)(profile_total_us / profile_count));
+        last_profile_us = profile_now_us;
+        profile_count = 0;
+        profile_parse_us = 0;
+        profile_classify_us = 0;
+        profile_total_us = 0;
+    }
+
     cJSON_Delete(root);
     return handled;
 }
