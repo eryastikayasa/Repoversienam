@@ -34,4 +34,5 @@ target_link_options(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=i2s_channel_read"
     "-Wl,--wrap=aec_process"
     "-Wl,--wrap=xQueueGenericSend"
+    "-Wl,--wrap=websocket_transport_send_text"
 )
