@@ -1,5 +1,6 @@
 #include "gemini_tool.h"
 #include "uart_control.h"
+#include "websocket.h"
 #include "websocket_transport.h"
 #include "cJSON.h"
 #include "esp_log.h"
@@ -29,26 +30,29 @@ static TaskHandle_t s_tool_worker = nullptr;
 
 extern "C" esp_err_t __real_websocket_transport_send_text(const char *text, size_t len);
 
-static void add_device_control_tool(cJSON *setup)
+static void add_function_declaration(cJSON *functions, const char *name, const char *description, cJSON *parameters)
 {
-    if (!cJSON_IsObject(setup)) return;
-
-    cJSON *tools = cJSON_AddArrayToObject(setup, "tools");
-    if (!tools) return;
-    cJSON *tool = cJSON_CreateObject();
-    cJSON *functions = cJSON_CreateArray();
+    if (!functions || !name || !description) {
+        cJSON_Delete(parameters);
+        return;
+    }
     cJSON *decl = cJSON_CreateObject();
-    if (!tool || !functions || !decl) {
-        cJSON_Delete(tool);
-        cJSON_Delete(functions);
+    if (!decl) {
+        cJSON_Delete(parameters);
+        return;
+    }
+    if (!cJSON_AddStringToObject(decl, "name", name) ||
+        !cJSON_AddStringToObject(decl, "description", description) ||
+        (parameters && !cJSON_AddItemToObject(decl, "parameters", parameters))) {
         cJSON_Delete(decl);
         return;
     }
+    cJSON_AddItemToArray(functions, decl);
+}
 
-    cJSON_AddItemToObject(tool, "functionDeclarations", functions);
-    cJSON_AddStringToObject(decl, "name", "control_device");
-    cJSON_AddStringToObject(decl, "description",
-        "Mengontrol perangkat rumah melalui UART. Gunakan hanya untuk aksi perangkat dan tunggu hasil fungsi sebelum menjawab pengguna.");
+static void add_device_control_tool(cJSON *functions)
+{
+    if (!functions) return;
 
     cJSON *parameters = cJSON_CreateObject();
     cJSON *properties = cJSON_CreateObject();
@@ -56,13 +60,8 @@ static void add_device_control_tool(cJSON *setup)
     cJSON *enum_values = cJSON_CreateArray();
     cJSON *required = cJSON_CreateArray();
     if (!parameters || !properties || !command || !enum_values || !required) {
-        cJSON_Delete(tool);
-        cJSON_Delete(decl);
-        cJSON_Delete(parameters);
-        cJSON_Delete(properties);
-        cJSON_Delete(command);
-        cJSON_Delete(enum_values);
-        cJSON_Delete(required);
+        cJSON_Delete(parameters); cJSON_Delete(properties); cJSON_Delete(command);
+        cJSON_Delete(enum_values); cJSON_Delete(required);
         return;
     }
 
@@ -84,9 +83,27 @@ static void add_device_control_tool(cJSON *setup)
     cJSON_AddItemToObject(command, "enum", enum_values);
     cJSON_AddItemToArray(required, cJSON_CreateString("command"));
     cJSON_AddItemToObject(parameters, "required", required);
-    cJSON_AddItemToObject(decl, "parameters", parameters);
-    cJSON_AddItemToArray(functions, decl);
-    cJSON_AddItemToArray(tools, tool);
+
+    add_function_declaration(
+        functions,
+        "control_device",
+        "Mengontrol perangkat rumah melalui UART. Gunakan hanya untuk aksi perangkat dan tunggu hasil fungsi sebelum menjawab pengguna.",
+        parameters);
+}
+
+static void add_standby_tool(cJSON *functions)
+{
+    if (!functions) return;
+
+    cJSON *parameters = cJSON_CreateObject();
+    if (!parameters) return;
+    cJSON_AddStringToObject(parameters, "type", "OBJECT");
+
+    add_function_declaration(
+        functions,
+        "standby_gemini",
+        "Gunakan ketika pengguna meminta Gemini berhenti, standby, mengakhiri percakapan, atau selesai berbicara. Tool ini mengakhiri session Gemini saat ini. Setelah session berakhir perangkat kembali menunggu Wake Word dan dapat dipanggil lagi dengan HI ESP. Ini bukan standby permanen dan tidak menonaktifkan Wake Word.",
+        parameters);
 }
 
 extern "C" esp_err_t __wrap_websocket_transport_send_text(const char *text, size_t len)
@@ -102,7 +119,22 @@ extern "C" esp_err_t __wrap_websocket_transport_send_text(const char *text, size
         return __real_websocket_transport_send_text(text, len);
     }
 
-    add_device_control_tool(setup);
+    cJSON *tools = cJSON_AddArrayToObject(setup, "tools");
+    cJSON *tool = cJSON_CreateObject();
+    cJSON *functions = cJSON_CreateArray();
+    if (!tools || !tool || !functions) {
+        cJSON_Delete(tool); cJSON_Delete(functions); cJSON_Delete(root);
+        return __real_websocket_transport_send_text(text, len);
+    }
+    if (!cJSON_AddItemToObject(tool, "functionDeclarations", functions)) {
+        cJSON_Delete(tool); cJSON_Delete(root);
+        return __real_websocket_transport_send_text(text, len);
+    }
+
+    add_device_control_tool(functions);
+    add_standby_tool(functions);
+    cJSON_AddItemToArray(tools, tool);
+
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!payload) return __real_websocket_transport_send_text(text, len);
@@ -129,10 +161,21 @@ static bool ensure_tool_worker(void)
 
     if (xTaskCreate(
             [](void *) {
-                ESP_LOGI(TAG, "UART tool worker START");
+                ESP_LOGI(TAG, "Gemini tool worker START");
                 for (;;) {
                     tool_job_t job = {};
                     if (xQueueReceive(s_tool_queue, &job, portMAX_DELAY) != pdPASS) continue;
+
+                    if (strcmp(job.name, "standby_gemini") == 0) {
+                        ESP_LOGI(TAG, "GEMINI_TOOL: standby_gemini requested id=%s", job.id);
+                        ESP_LOGI("WEBSOCKET", "WS: ending current Gemini session");
+                        /* Terminal action: deliberately do NOT send toolResponse.
+                         * websocket_end_session marks this disconnect intentional;
+                         * app_startup's existing disconnect lifecycle then re-arms
+                         * Wake Word without automatic session resumption. */
+                        websocket_end_session();
+                        continue;
+                    }
 
                     bool success = false;
                     const char *result = nullptr;
@@ -190,7 +233,7 @@ static bool ensure_tool_worker(void)
             TOOL_WORKER_PRIORITY,
             &s_tool_worker) != pdPASS) {
         s_tool_worker = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat UART tool worker");
+        ESP_LOGE(TAG, "Gagal membuat Gemini tool worker");
         return false;
     }
     return true;
@@ -213,20 +256,27 @@ extern "C" void gemini_tool_handle_call(const cJSON *tool_call)
         cJSON *id = cJSON_GetObjectItemCaseSensitive(fc, "id");
         cJSON *name = cJSON_GetObjectItemCaseSensitive(fc, "name");
         cJSON *args = cJSON_GetObjectItemCaseSensitive(fc, "args");
-        cJSON *command = cJSON_IsObject(args)
-            ? cJSON_GetObjectItemCaseSensitive(args, "command") : nullptr;
-
         if (!cJSON_IsString(id) || !id->valuestring ||
             !cJSON_IsString(name) || !name->valuestring ||
-            !cJSON_IsObject(args) ||
-            !cJSON_IsString(command) || !command->valuestring) {
+            !cJSON_IsObject(args)) {
             ESP_LOGW(TAG, "toolCall function tidak lengkap; diabaikan");
             continue;
         }
 
+        const bool is_standby = strcmp(name->valuestring, "standby_gemini") == 0;
+        cJSON *command = cJSON_GetObjectItemCaseSensitive(args, "command");
+        if (!is_standby && (!cJSON_IsString(command) || !command->valuestring)) {
+            ESP_LOGW(TAG, "control_device tanpa args.command; diabaikan");
+            continue;
+        }
+        if (is_standby && cJSON_GetObjectItemCaseSensitive(args, "command")) {
+            ESP_LOGW(TAG, "standby_gemini tidak membutuhkan command; diabaikan field command");
+        }
+
+        const size_t command_len = command && cJSON_IsString(command) ? strlen(command->valuestring) : 0U;
         if (strlen(id->valuestring) >= TOOL_ID_MAX ||
             strlen(name->valuestring) >= TOOL_NAME_MAX ||
-            strlen(command->valuestring) >= TOOL_COMMAND_MAX) {
+            command_len >= TOOL_COMMAND_MAX) {
             ESP_LOGW(TAG, "toolCall field terlalu panjang");
             continue;
         }
@@ -234,7 +284,8 @@ extern "C" void gemini_tool_handle_call(const cJSON *tool_call)
         tool_job_t job = {};
         strlcpy(job.id, id->valuestring, sizeof(job.id));
         strlcpy(job.name, name->valuestring, sizeof(job.name));
-        strlcpy(job.command, command->valuestring, sizeof(job.command));
+        if (command && cJSON_IsString(command))
+            strlcpy(job.command, command->valuestring, sizeof(job.command));
 
         if (xQueueSend(s_tool_queue, &job, 0) != pdPASS)
             ESP_LOGW(TAG, "Tool queue penuh; function id=%s diabaikan", job.id);
