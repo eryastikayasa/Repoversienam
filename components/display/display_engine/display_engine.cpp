@@ -13,7 +13,10 @@
 
 namespace {
 
-constexpr int DISPLAY_ENGINE_FRAME_MS = 100;
+// The existing display task remains the single renderer. 25 FPS gives the
+// face enough temporal resolution for natural blink/gaze/mouth motion without
+// creating another task or changing any realtime audio task.
+constexpr int DISPLAY_ENGINE_FRAME_MS = 40;
 constexpr int DISPLAY_ENGINE_WIDTH = DISPLAY_DRIVER_WIDTH;
 constexpr int DISPLAY_ENGINE_HEIGHT = DISPLAY_DRIVER_HEIGHT;
 constexpr size_t DISPLAY_FRAMEBUFFER_SIZE =
@@ -194,8 +197,8 @@ void display_set_system_state(face_state_t face, const char *status)
     display_text_set_status(text);
 
     /* Repo6's renderer selects user/gemini layers for listening/speaking.
-     * Mirror the system status into the active layer so the requested
-     * Repo5-style status is actually visible without adding a render task. */
+     * Mirror the system status into the active layer so the status remains
+     * visible without adding another render task. */
     display_text_set_user("");
     display_text_set_gemini("");
     if (face == FACE_LISTENING) {
