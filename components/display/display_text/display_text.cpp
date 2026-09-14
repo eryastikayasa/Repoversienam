@@ -22,8 +22,7 @@ static char s_user_render_copy[TRANSCRIPT_TEXT_CAP] = {0};
 static char s_gemini_render_copy[TRANSCRIPT_TEXT_CAP] = {0};
 static uint16_t s_user_visible_len = 0;
 static uint16_t s_gemini_visible_len = 0;
-static uint16_t s_user_scroll_offset = 0;
-static uint16_t s_gemini_scroll_offset = 0;
+
 static uint16_t s_status_scroll_offset = 0;
 static uint32_t s_last_type_ms = 0;
 static uint32_t s_last_status_update_ms = 0;
@@ -219,8 +218,7 @@ void display_text_init(void)
     s_gemini_render_copy[0] = '\0';
     s_user_visible_len = 0;
     s_gemini_visible_len = 0;
-    s_user_scroll_offset = 0;
-    s_gemini_scroll_offset = 0;
+    
     s_status_scroll_offset = 0;
     s_last_type_ms = 0;
     s_last_status_update_ms = 0;
@@ -256,7 +254,7 @@ void display_text_set_user(const char *text)
 {
     portENTER_CRITICAL(&s_text_mux);
     set_target_text(s_user_target, sizeof(s_user_target), text, s_user_visible_len);
-    s_user_scroll_offset = 0;
+    
     portEXIT_CRITICAL(&s_text_mux);
 }
 
@@ -264,7 +262,7 @@ void display_text_set_gemini(const char *text)
 {
     portENTER_CRITICAL(&s_text_mux);
     set_target_text(s_gemini_target, sizeof(s_gemini_target), text, s_gemini_visible_len);
-    s_gemini_scroll_offset = 0;
+    
     portEXIT_CRITICAL(&s_text_mux);
 }
 
