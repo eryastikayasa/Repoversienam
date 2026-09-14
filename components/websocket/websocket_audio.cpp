@@ -3,6 +3,7 @@
 #include "gemini_protocol.h"
 #include "audio_engine.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mbedtls/base64.h"
 #include "freertos/FreeRTOS.h"
 #include <stdio.h>
@@ -11,6 +12,56 @@
 static const char *TAG = "WS_AUDIO";
 static char s_audio_b64[1024];
 static char s_audio_json[1200];
+
+static uint64_t s_profile_last_us = 0;
+static uint64_t s_profile_count = 0;
+static uint64_t s_profile_encode_us = 0;
+static uint64_t s_profile_encode_max_us = 0;
+static uint64_t s_profile_json_us = 0;
+static uint64_t s_profile_json_max_us = 0;
+static uint64_t s_profile_send_us = 0;
+static uint64_t s_profile_send_max_us = 0;
+static uint64_t s_profile_total_us = 0;
+static uint64_t s_profile_total_max_us = 0;
+
+static void profile_record(uint32_t encode_us, uint32_t json_us, uint32_t send_us, uint32_t total_us)
+{
+    const uint64_t now_us = (uint64_t)esp_timer_get_time();
+    ++s_profile_count;
+    s_profile_encode_us += encode_us;
+    s_profile_json_us += json_us;
+    s_profile_send_us += send_us;
+    s_profile_total_us += total_us;
+    if (encode_us > s_profile_encode_max_us) s_profile_encode_max_us = encode_us;
+    if (json_us > s_profile_json_max_us) s_profile_json_max_us = json_us;
+    if (send_us > s_profile_send_max_us) s_profile_send_max_us = send_us;
+    if (total_us > s_profile_total_max_us) s_profile_total_max_us = total_us;
+    if (!s_profile_last_us) s_profile_last_us = now_us;
+
+    if (now_us - s_profile_last_us >= 5000000ULL) {
+        ESP_LOGI(TAG,
+                 "MIC_TX_PROFILE: count=%llu encode_avg_us=%llu encode_max_us=%llu json_avg_us=%llu json_max_us=%llu send_avg_us=%llu send_max_us=%llu total_avg_us=%llu total_max_us=%llu",
+                 (unsigned long long)s_profile_count,
+                 (unsigned long long)(s_profile_encode_us / s_profile_count),
+                 (unsigned long long)s_profile_encode_max_us,
+                 (unsigned long long)(s_profile_json_us / s_profile_count),
+                 (unsigned long long)s_profile_json_max_us,
+                 (unsigned long long)(s_profile_send_us / s_profile_count),
+                 (unsigned long long)s_profile_send_max_us,
+                 (unsigned long long)(s_profile_total_us / s_profile_count),
+                 (unsigned long long)s_profile_total_max_us);
+        s_profile_last_us = now_us;
+        s_profile_count = 0;
+        s_profile_encode_us = 0;
+        s_profile_encode_max_us = 0;
+        s_profile_json_us = 0;
+        s_profile_json_max_us = 0;
+        s_profile_send_us = 0;
+        s_profile_send_max_us = 0;
+        s_profile_total_us = 0;
+        s_profile_total_max_us = 0;
+    }
+}
 
 static void mic_sink(const uint8_t *pcm, size_t len, void *ctx)
 {
@@ -38,6 +89,8 @@ bool websocket_audio_send_frame(const uint8_t *data, size_t len)
         return false;
     }
 
+    const int64_t total_start_us = esp_timer_get_time();
+    const int64_t encode_start_us = total_start_us;
     size_t b64_len = 0;
     if (mbedtls_base64_encode(
             reinterpret_cast<unsigned char *>(s_audio_b64), sizeof(s_audio_b64) - 1,
@@ -45,14 +98,22 @@ bool websocket_audio_send_frame(const uint8_t *data, size_t len)
         return false;
     }
     s_audio_b64[b64_len] = '\0';
+    const uint32_t encode_us = (uint32_t)(esp_timer_get_time() - encode_start_us);
 
+    const int64_t json_start_us = esp_timer_get_time();
     const int n = snprintf(
         s_audio_json, sizeof(s_audio_json),
         "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
         s_audio_b64);
+    const uint32_t json_us = (uint32_t)(esp_timer_get_time() - json_start_us);
     if (n <= 0 || (size_t)n >= sizeof(s_audio_json)) return false;
 
-    return websocket_transport_send_text(s_audio_json, (size_t)n) == ESP_OK;
+    const int64_t send_start_us = esp_timer_get_time();
+    const bool sent = websocket_transport_send_text(s_audio_json, (size_t)n) == ESP_OK;
+    const uint32_t send_us = (uint32_t)(esp_timer_get_time() - send_start_us);
+    const uint32_t total_us = (uint32_t)(esp_timer_get_time() - total_start_us);
+    profile_record(encode_us, json_us, send_us, total_us);
+    return sent;
 }
 
 void websocket_audio_on_disconnected(void)
