@@ -101,9 +101,8 @@ static void draw_text_window(const char *text, uint16_t visible_len, int text_x)
     if ((int)count > max_chars) first = count - (size_t)max_chars;
 
     const size_t draw_count = count - first;
-    for (size_t i = 0; i < draw_count; ++i) {
+    for (size_t i = 0; i < draw_count; ++i)
         draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[first + i]);
-    }
 }
 
 static void set_target_text(char *dst, size_t dst_size, const char *text, uint16_t &visible_len)
@@ -133,13 +132,6 @@ static void set_target_text(char *dst, size_t dst_size, const char *text, uint16
 
     memcpy(dst, sanitized, new_len + 1U);
     visible_len = (uint16_t)current_visible;
-}
-
-static void reset_typing_state(char *target, uint16_t &visible_len, const char *text)
-{
-    target[0] = '\0';
-    visible_len = 0;
-    set_target_text(target, TRANSCRIPT_TEXT_CAP, text, visible_len);
 }
 
 static uint16_t advance_status_offset(const char *text, uint16_t offset, uint32_t steps)
@@ -261,10 +253,9 @@ void display_text_set_gemini(const char *text)
 void display_text_append_user(const char *text)
 {
     portENTER_CRITICAL(&s_text_mux);
-    const size_t old_len = strlen(s_user_target);
-    if (text && text[0] && old_len + 1U < sizeof(s_user_target)) {
-        if (s_user_target[old_len - (old_len > 0 ? 1 : 0)] != ' ') s_user_target[old_len++] = ' ';
-        size_t out = old_len;
+    size_t out = strlen(s_user_target);
+    if (text && text[0] && out + 1U < sizeof(s_user_target)) {
+        if (out > 0 && s_user_target[out - 1] != ' ') s_user_target[out++] = ' ';
         for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_user_target); ++i) {
             const unsigned char c = (unsigned char)text[i];
             if (c >= 0x20 && c <= 0x7E) s_user_target[out++] = (char)c;
@@ -277,9 +268,8 @@ void display_text_append_user(const char *text)
 void display_text_append_gemini(const char *text)
 {
     portENTER_CRITICAL(&s_text_mux);
-    const size_t old_len = strlen(s_gemini_target);
-    if (text && text[0] && old_len + 1U < sizeof(s_gemini_target)) {
-        size_t out = old_len;
+    size_t out = strlen(s_gemini_target);
+    if (text && text[0] && out + 1U < sizeof(s_gemini_target)) {
         if (out > 0 && s_gemini_target[out - 1] != ' ') s_gemini_target[out++] = ' ';
         for (size_t i = 0; text[i] != '\0' && out + 1U < sizeof(s_gemini_target); ++i) {
             const unsigned char c = (unsigned char)text[i];
@@ -365,22 +355,20 @@ void display_text_render_status(void)
     constexpr int CHAR_WIDTH = 6;
     constexpr int TEXT_Y = OLED_HEIGHT - 5;
     const size_t len = strlen(text);
-    const int max_chars = OLED_WIDTH / CHAR_WIDTH;
     if (len == 0) return;
 
+    const int max_chars = OLED_WIDTH / CHAR_WIDTH;
     if ((int)len <= max_chars) {
         const int x = (OLED_WIDTH - (int)len * CHAR_WIDTH) / 2;
         for (size_t i = 0; i < len; ++i) draw_text_char(x + (int)i * CHAR_WIDTH, TEXT_Y, text[i]);
         return;
     }
 
-    const int text_px = (int)len * CHAR_WIDTH;
     int x = OLED_WIDTH - (int)offset;
     for (size_t i = 0; i < len; ++i) {
         const int px = x + (int)i * CHAR_WIDTH;
         if (px + 5 >= 0 && px < OLED_WIDTH) draw_text_char(px, TEXT_Y, text[i]);
     }
-    (void)text_px;
 }
 
 const uint8_t *display_text_buffer(void)
