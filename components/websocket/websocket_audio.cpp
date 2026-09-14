@@ -93,8 +93,6 @@ static void profile_record(uint32_t encode_us, uint32_t json_us,
 static void mic_sink(const uint8_t *pcm, size_t len, void *ctx)
 {
     (void)ctx;
-    /* This is the existing Repo6 AudioEngine frame boundary. It is not an
-     * audio queue or buffer owned by WebSocket. */
     if (!pcm || len != 640U || !websocket_transport_is_connected() ||
         !gemini_protocol_setup_complete() || !gemini_protocol_greeting_finished()) {
         return;
@@ -138,7 +136,11 @@ bool websocket_audio_send_frame(const uint8_t *data, size_t len)
     uint64_t poll_before = 0;
     uint64_t tls_before = 0;
     uint64_t transport_before = 0;
-    websocket_transport_profile_snapshot(&poll_before, &tls_before, &transport_before);
+    int poll_ret_before = 0;
+    int transport_ret_before = 0;
+    ssize_t tls_ret_before = 0;
+    websocket_transport_profile_snapshot(&poll_before, &tls_before, &transport_before,
+                                         &poll_ret_before, &transport_ret_before, &tls_ret_before);
 
     const int64_t send_start_us = esp_timer_get_time();
     const bool sent = websocket_transport_send_text(s_audio_json, (size_t)n) == ESP_OK;
@@ -147,7 +149,11 @@ bool websocket_audio_send_frame(const uint8_t *data, size_t len)
     uint64_t poll_after = 0;
     uint64_t tls_after = 0;
     uint64_t transport_after = 0;
-    websocket_transport_profile_snapshot(&poll_after, &tls_after, &transport_after);
+    int poll_ret_after = 0;
+    int transport_ret_after = 0;
+    ssize_t tls_ret_after = 0;
+    websocket_transport_profile_snapshot(&poll_after, &tls_after, &transport_after,
+                                         &poll_ret_after, &transport_ret_after, &tls_ret_after);
 
     const uint32_t poll_us = (uint32_t)(poll_after - poll_before);
     const uint32_t tls_us = (uint32_t)(tls_after - tls_before);
