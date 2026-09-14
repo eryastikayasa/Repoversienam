@@ -95,13 +95,18 @@ static void log_main_task_audit(const char *stage)
              (unsigned)psram_largest);
 }
 
+static bool stop_mic_capture_deterministic(const char *reason)
+{
+    if (audio_engine_stop_capture_and_wait()) return true;
+    ESP_LOGW(TAG, "MIC stop wait retry: reason=%s", reason ? reason : "unknown");
+    return audio_engine_stop_capture_and_wait();
+}
+
 extern "C" void app_startup_run(void)
 {
     ESP_LOGI(TAG, "Repo6 startup: app_startup_run()");
     log_main_task_audit("boot");
 
-    /* Repo6 startup architecture remains intact; only the OLED presentation
-     * is initialized here before the system startup sequence continues. */
     display_engine_init();
     display_engine_start();
     display_set_system_state(FACE_IDLE, "Memulai...");
@@ -172,7 +177,7 @@ extern "C" void app_startup_run(void)
             display_set_system_state(FACE_LISTENING, "Menghubungkan Gemini...");
             ESP_LOGI(TAG, "Trigger -> hentikan WakeWord dan lepaskan MIC");
             (void)wakeword_stop();
-            if (!audio_engine_stop_capture_and_wait()) {
+            if (!stop_mic_capture_deterministic("trigger")) {
                 ESP_LOGE(TAG, "MIC ownership transition gagal -> WakeWord");
                 display_set_system_state(FACE_ERROR, "MIC gagal");
                 (void)wakeword_rearm();
@@ -206,7 +211,7 @@ extern "C" void app_startup_run(void)
                      (unsigned long long)websocket_goaway_time_left_ms());
             display_set_system_state(FACE_LISTENING, "Menghubungkan Gemini...");
             (void)wakeword_stop();
-            if (!audio_engine_stop_capture_and_wait() || !audio_engine_prepare_gemini_input()) {
+            if (!stop_mic_capture_deterministic("resume") || !audio_engine_prepare_gemini_input()) {
                 ESP_LOGE(TAG, "MIC ownership transition gagal untuk session resumption -> Wake Word");
                 display_set_system_state(FACE_ERROR, "MIC gagal");
                 s_session_was_connected = false;
@@ -237,7 +242,7 @@ extern "C" void app_startup_run(void)
             s_assistant_requested = false;
             ESP_LOGI(TAG, "Sesi Gemini selesai -> kembali menunggu Wake Word");
             audio_engine_stop_input_session();
-            if (!audio_engine_stop_capture_and_wait()) {
+            if (!stop_mic_capture_deterministic("gemini_disconnected")) {
                 ESP_LOGE(TAG, "MIC Gemini gagal dilepas saat sesi selesai");
                 display_set_system_state(FACE_ERROR, "MIC gagal");
             }
