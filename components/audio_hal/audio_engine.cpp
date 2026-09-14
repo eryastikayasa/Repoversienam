@@ -19,6 +19,8 @@ static constexpr size_t CRITICAL_BYTES = 16U * 1024U;
 static constexpr size_t PLAYBACK_CHUNK = 2048U;
 static constexpr TickType_t LOCK_TIMEOUT = pdMS_TO_TICKS(2);
 static constexpr TickType_t PLAYBACK_YIELD = pdMS_TO_TICKS(1);
+static constexpr UBaseType_t PLAYBACK_PRIORITY = 5U;
+static constexpr BaseType_t PLAYBACK_CORE = 0;
 
 static volatile bool s_initialized = false;
 static volatile audio_engine_state_t s_state = AUDIO_ENGINE_IDLE;
@@ -133,9 +135,10 @@ static void playback_task(void *arg)
     int64_t last_stats_us = 0;
     int64_t last_diag_us = 0;
 
-    ESP_LOGI(TAG, "Playback task: PCM16 mono %uHz, ring=%uB, prebuffer=%uB, chunk=%uB",
+    ESP_LOGI(TAG, "Playback task: PCM16 mono %uHz, ring=%uB, prebuffer=%uB, chunk=%uB priority=%u core=%d",
              (unsigned)OUTPUT_RATE, (unsigned)RING_BYTES,
-             (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK);
+             (unsigned)PREBUFFER_BYTES, (unsigned)PLAYBACK_CHUNK,
+             (unsigned)PLAYBACK_PRIORITY, (int)PLAYBACK_CORE);
 
     for (;;) {
         if (!s_stream) {
@@ -256,7 +259,7 @@ bool audio_engine_init(void)
     }
 
     reset_turn(0);
-    if (xTaskCreatePinnedToCore(playback_task, "audio_playback", 4096, nullptr, 4, &s_playback_task, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(playback_task, "audio_playback", 4096, nullptr, PLAYBACK_PRIORITY, &s_playback_task, PLAYBACK_CORE) != pdPASS) {
         ESP_LOGE(TAG, "Playback task create gagal");
         s_state = AUDIO_ENGINE_ERROR;
         return false;
