@@ -186,3 +186,9 @@ void display_engine_stop(void)
 {
     s_running = false;
 }
+
+void display_set_system_state(face_state_t face, const char *status)
+{
+    display_face_set_state(face);
+    display_text_set_status(status ? status : "");
+}
