@@ -39,6 +39,7 @@ static uint64_t s_profile_tls_us = 0, s_profile_tls_max_us = 0;
 static uint64_t s_profile_transport_us = 0, s_profile_transport_max_us = 0;
 static uint64_t s_profile_send_us = 0, s_profile_send_max_us = 0;
 static uint64_t s_profile_total_us = 0, s_profile_total_max_us = 0;
+static uint32_t s_send_diag_frames = 0;
 
 static void drain_mic_net_queue(void)
 {
@@ -121,12 +122,26 @@ static bool send_frame_network(const uint8_t *data, size_t len)
     const uint32_t json_us = (uint32_t)(esp_timer_get_time() - json_start);
     if (n <= 0 || (size_t)n >= sizeof(s_audio_json)) return false;
     uint64_t poll_before = 0, tls_before = 0, transport_before = 0;
-    websocket_transport_profile_snapshot(&poll_before, &tls_before, &transport_before);
+    int last_poll_before = 0, last_transport_before = 0; ssize_t last_tls_before = 0;
+    websocket_transport_profile_snapshot(&poll_before, &tls_before, &transport_before,
+                                         &last_poll_before, &last_transport_before, &last_tls_before);
+    const uint32_t diag_no = s_send_diag_frames++;
+    if (diag_no < 3U) {
+        ESP_LOGI(TAG, "MIC_NET_TX SEND_BEGIN frame=%u generation=%lu connected=%d client=%p client_connected=%d setup=%d greeting=%d",
+                 (unsigned)diag_no, (unsigned long)websocket_transport_generation(),
+                 websocket_transport_is_connected() ? 1 : 0,
+                 (void *)websocket_transport_client(),
+                 websocket_transport_client() && esp_websocket_client_is_connected(websocket_transport_client()) ? 1 : 0,
+                 gemini_protocol_setup_complete() ? 1 : 0,
+                 gemini_protocol_greeting_finished() ? 1 : 0);
+    }
     const int64_t send_start = esp_timer_get_time();
     const esp_err_t send_result = websocket_transport_send_text(s_audio_json, (size_t)n);
     const uint32_t send_us = (uint32_t)(esp_timer_get_time() - send_start);
     uint64_t poll_after = 0, tls_after = 0, transport_after = 0;
-    websocket_transport_profile_snapshot(&poll_after, &tls_after, &transport_after);
+    int last_poll_after = 0, last_transport_after = 0; ssize_t last_tls_after = 0;
+    websocket_transport_profile_snapshot(&poll_after, &tls_after, &transport_after,
+                                         &last_poll_after, &last_transport_after, &last_tls_after);
     const uint32_t total_us = (uint32_t)(esp_timer_get_time() - total_start);
     profile_record(encode_us, json_us, (uint32_t)(poll_after - poll_before),
                    (uint32_t)(tls_after - tls_before), (uint32_t)(transport_after - transport_before),
@@ -135,16 +150,25 @@ static bool send_frame_network(const uint8_t *data, size_t len)
         ++s_send_ok;
         return true;
     }
+    ESP_LOGW(TAG, "MIC_NET_TX SEND_FAIL result=%s elapsed_us=%u generation=%lu transport_connected=%d client=%p client_connected=%d poll_ret=%d transport_ret=%d tls_ret=%ld poll_delta_us=%u transport_delta_us=%u tls_delta_us=%u",
+             esp_err_to_name(send_result), (unsigned)send_us,
+             (unsigned long)websocket_transport_generation(),
+             websocket_transport_is_connected() ? 1 : 0,
+             (void *)websocket_transport_client(),
+             websocket_transport_client() && esp_websocket_client_is_connected(websocket_transport_client()) ? 1 : 0,
+             last_poll_after, last_transport_after, (long)last_tls_after,
+             (unsigned)(poll_after - poll_before), (unsigned)(transport_after - transport_before),
+             (unsigned)(tls_after - tls_before));
     if (send_result == ESP_ERR_TIMEOUT) {
         ++s_send_timeout;
-        ++s_send_return_zero;
-        ESP_LOGW(TAG, "MIC_NET_TX: SEND_TIMEOUT after %uus; stopping MIC session and aborting WebSocket", (unsigned)send_us);
+        if (last_poll_after == 0 || last_transport_after == 0) ++s_send_return_zero;
+        ESP_LOGW(TAG, "MIC_NET_TX: SEND_TIMEOUT; stopping MIC session and aborting WebSocket");
     } else if (send_result == ESP_ERR_INVALID_STATE) {
         ++s_send_invalid_state;
         ESP_LOGW(TAG, "MIC_NET_TX: SEND_INVALID_STATE; stopping MIC session");
     } else {
         ++s_send_transport_error;
-        ESP_LOGW(TAG, "MIC_NET_TX: SEND_TRANSPORT_ERROR after %uus; stopping MIC session and aborting WebSocket", (unsigned)send_us);
+        ESP_LOGW(TAG, "MIC_NET_TX: SEND_TRANSPORT_ERROR; stopping MIC session and aborting WebSocket");
     }
     audio_engine_stop_input_session();
     bool stopped = audio_engine_stop_capture_and_wait();
