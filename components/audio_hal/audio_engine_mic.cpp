@@ -15,15 +15,14 @@ static const char *TAG = "AUDIO_ENGINE_MIC";
 
 /* Gemini Live target: PCM16, mono, 16 kHz, 20 ms = 640 bytes. */
 static constexpr size_t MIC_FRAME_BYTES = 640U;
-/* Audio HAL keeps its 512-sample AEC/NS frame, so one read is 32 ms and is
- * then split into 20 ms transport frames without changing the HAL contract. */
 static constexpr size_t MIC_READ_BYTES = 1024U;
 static constexpr uint32_t MIC_IDLE_TIMEOUT_MS = 60000U;
 static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
-/* 16 x 20 ms = 320 ms. Bounded and deliberately below a one-second buffer. */
+/* 16 x 20 ms = 320 ms. The queue is bounded; the producer never waits. */
 static constexpr size_t MIC_TX_QUEUE_DEPTH = 16U;
 static constexpr TickType_t MIC_STOP_WAIT = pdMS_TO_TICKS(1000);
+static constexpr uint32_t MIC_METRICS_PERIOD_MS = 5000U;
 
 enum mic_owner_t {
     MIC_OWNER_NONE = 0,
@@ -50,7 +49,17 @@ static uint8_t s_tx_queue_storage[MIC_TX_QUEUE_DEPTH][MIC_FRAME_BYTES];
 static QueueHandle_t s_tx_queue = nullptr;
 static StaticSemaphore_t s_capture_stopped_storage;
 static SemaphoreHandle_t s_capture_stopped = nullptr;
-static uint32_t s_tx_queue_drops = 0;
+
+static volatile uint32_t s_tx_queue_drops = 0;
+static volatile uint32_t s_tx_queue_highwater = 0;
+static volatile uint32_t s_tx_block_max_us = 0;
+
+static inline void metric_inc(volatile uint32_t *value) { __atomic_add_fetch(value, 1U, __ATOMIC_RELAXED); }
+static void metric_max(volatile uint32_t *value, uint32_t candidate)
+{
+    uint32_t old = __atomic_load_n(value, __ATOMIC_RELAXED);
+    while (old < candidate && !__atomic_compare_exchange_n(value, &old, candidate, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
 
 static const char *owner_name(mic_owner_t owner)
 {
@@ -81,6 +90,16 @@ static bool frame_has_activity(const uint8_t *data, size_t len)
     return false;
 }
 
+static void log_mic_metrics(const char *reason)
+{
+    ESP_LOGI(TAG,
+             "MIC METRICS[%s] queue_high=%lu drops=%lu block_max_us=%lu",
+             reason ? reason : "periodic",
+             (unsigned long)__atomic_load_n(&s_tx_queue_highwater, __ATOMIC_RELAXED),
+             (unsigned long)__atomic_load_n(&s_tx_queue_drops, __ATOMIC_RELAXED),
+             (unsigned long)__atomic_load_n(&s_tx_block_max_us, __ATOMIC_RELAXED));
+}
+
 static void log_mic_task_audit(const char *stage)
 {
     const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -109,15 +128,29 @@ static void sink_task(void *arg)
 {
     (void)arg;
     uint8_t frame[MIC_FRAME_BYTES];
+    int64_t last_metrics_us = 0;
     ESP_LOGI(TAG, "Mic transport worker aktif; queue=%ums, frame=%uB",
              (unsigned)(MIC_TX_QUEUE_DEPTH * 20U), (unsigned)MIC_FRAME_BYTES);
     for (;;) {
-        if (xQueueReceive(s_tx_queue, frame, portMAX_DELAY) != pdTRUE) continue;
+        if (xQueueReceive(s_tx_queue, frame, pdMS_TO_TICKS(MIC_METRICS_PERIOD_MS)) != pdTRUE) {
+            log_mic_metrics("periodic");
+            continue;
+        }
         if (!s_input_session_active || s_mic_owner != MIC_OWNER_GEMINI) continue;
 
+        const int64_t start_us = esp_timer_get_time();
         audio_engine_mic_sink_cb_t sink = s_mic_sink;
         void *sink_ctx = s_mic_sink_ctx;
         if (sink) sink(frame, MIC_FRAME_BYTES, sink_ctx);
+        metric_max(&s_tx_block_max_us, (uint32_t)(esp_timer_get_time() - start_us));
+
+        const UBaseType_t queued = uxQueueMessagesWaiting(s_tx_queue);
+        metric_max(&s_tx_queue_highwater, (uint32_t)queued);
+        const int64_t now_us = esp_timer_get_time();
+        if (!last_metrics_us || now_us - last_metrics_us >= 5000000LL) {
+            last_metrics_us = now_us;
+            log_mic_metrics("periodic");
+        }
     }
 }
 
@@ -184,12 +217,15 @@ static void capture_task(void *arg)
 
             if (s_tx_queue && s_mic_sink) {
                 if (xQueueSend(s_tx_queue, frame_buffer, 0) != pdTRUE) {
-                    ++s_tx_queue_drops;
-                    if ((s_tx_queue_drops & 0x1FU) == 1U) {
+                    metric_inc(&s_tx_queue_drops);
+                    const uint32_t drops = __atomic_load_n(&s_tx_queue_drops, __ATOMIC_RELAXED);
+                    if ((drops & 0x1FU) == 1U) {
                         ESP_LOGW(TAG, "MIC transport queue penuh; drop=%u (queue=%ums)",
-                                 (unsigned)s_tx_queue_drops,
+                                 (unsigned)drops,
                                  (unsigned)(MIC_TX_QUEUE_DEPTH * 20U));
                     }
+                } else {
+                    metric_max(&s_tx_queue_highwater, (uint32_t)uxQueueMessagesWaiting(s_tx_queue));
                 }
             }
         }
@@ -202,6 +238,7 @@ static void capture_task(void *arg)
     s_capture_task = nullptr;
     log_owner(MIC_OWNER_NONE);
     ESP_LOGI(TAG, "MIC capture task benar-benar berhenti");
+    log_mic_metrics("capture_stop");
     if (s_capture_stopped) xSemaphoreGive(s_capture_stopped);
     vTaskDelete(nullptr);
 }
@@ -338,6 +375,7 @@ void audio_engine_stop_input_session(void)
     if (!s_input_session_active) return;
     s_input_session_active = false;
     ESP_LOGI(TAG, "MIC session STOP: AudioEngine");
+    log_mic_metrics("session_stop");
     log_mic_task_audit("session_stop");
 }
 
