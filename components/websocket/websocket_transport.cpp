@@ -61,6 +61,12 @@ esp_err_t websocket_transport_disconnect(void)
     s_connected = false; if (!s_client) return ESP_OK;
     return esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
 }
+esp_err_t websocket_transport_abort(void)
+{
+    s_connected = false;
+    if (!s_client) return ESP_OK;
+    return esp_websocket_client_stop(s_client);
+}
 bool websocket_transport_is_connected(void)
 {
     return s_client && s_connected && esp_websocket_client_is_connected(s_client);
@@ -76,7 +82,13 @@ esp_err_t websocket_transport_send_text(const char *text, size_t len)
     const bool mic_sender = task_name && strcmp(task_name, "mic_net_tx") == 0;
     const TickType_t timeout = mic_sender ? MIC_SEND_TIMEOUT : NORMAL_SEND_TIMEOUT;
     const int sent = esp_websocket_client_send_text(s_client, text, (int)len, timeout);
-    return sent == (int)len ? ESP_OK : ESP_FAIL;
+    if (sent == (int)len) return ESP_OK;
+    if (sent == 0 && mic_sender) {
+        ESP_LOGW(TAG, "MIC_NET_TX send timeout: transport writable budget expired without bytes written");
+        return ESP_ERR_TIMEOUT;
+    }
+    if (sent < 0) return ESP_FAIL;
+    return ESP_FAIL;
 }
 void websocket_transport_event_connected(void)
 {
