@@ -14,6 +14,9 @@ namespace {
 static volatile uint64_t s_poll_write_us = 0;
 static volatile uint64_t s_tls_write_us = 0;
 static volatile uint64_t s_transport_write_us = 0;
+static volatile int s_last_poll_write_ret = 0;
+static volatile int s_last_transport_write_ret = 0;
+static volatile ssize_t s_last_tls_write_ret = 0;
 static volatile uint64_t s_capture_read_us = 0;
 static volatile uint64_t s_i2s_read_us = 0;
 static volatile uint64_t s_aec_us = 0;
@@ -77,20 +80,41 @@ extern "C" BaseType_t __real_xQueueGenericSend(QueueHandle_t queue, const void *
 extern "C" int __wrap_esp_transport_poll_write(esp_transport_handle_t t, int timeout_ms)
 {
     if (!is_mic_transport_task()) return __real_esp_transport_poll_write(t, timeout_ms);
-    const int64_t start = esp_timer_get_time(); const int ret = __real_esp_transport_poll_write(t, timeout_ms);
-    add_us(&s_poll_write_us, (uint64_t)(esp_timer_get_time() - start)); return ret;
+    const int64_t start = esp_timer_get_time();
+    const int ret = __real_esp_transport_poll_write(t, timeout_ms);
+    add_us(&s_poll_write_us, (uint64_t)(esp_timer_get_time() - start));
+    __atomic_store_n(&s_last_poll_write_ret, ret, __ATOMIC_RELAXED);
+    if (ret <= 0) {
+        ESP_LOGW("WS_TRANSPORT", "MIC POLL_WRITE result=%d timeout_ms=%d elapsed_us=%llu task=%s",
+                 ret, timeout_ms, (unsigned long long)(esp_timer_get_time() - start), pcTaskGetName(nullptr));
+    }
+    return ret;
 }
 extern "C" int __wrap_esp_transport_write(esp_transport_handle_t t, const char *buffer, int len, int timeout_ms)
 {
     if (!is_mic_transport_task()) return __real_esp_transport_write(t, buffer, len, timeout_ms);
-    const int64_t start = esp_timer_get_time(); const int ret = __real_esp_transport_write(t, buffer, len, timeout_ms);
-    add_us(&s_transport_write_us, (uint64_t)(esp_timer_get_time() - start)); return ret;
+    const int64_t start = esp_timer_get_time();
+    const int ret = __real_esp_transport_write(t, buffer, len, timeout_ms);
+    add_us(&s_transport_write_us, (uint64_t)(esp_timer_get_time() - start));
+    __atomic_store_n(&s_last_transport_write_ret, ret, __ATOMIC_RELAXED);
+    if (ret <= 0) {
+        ESP_LOGW("WS_TRANSPORT", "MIC TRANSPORT_WRITE result=%d len=%d timeout_ms=%d elapsed_us=%llu task=%s",
+                 ret, len, timeout_ms, (unsigned long long)(esp_timer_get_time() - start), pcTaskGetName(nullptr));
+    }
+    return ret;
 }
 extern "C" ssize_t __wrap_esp_tls_conn_write(esp_tls_t *tls, const void *data, size_t datalen)
 {
     if (!is_mic_transport_task()) return __real_esp_tls_conn_write(tls, data, datalen);
-    const int64_t start = esp_timer_get_time(); const ssize_t ret = __real_esp_tls_conn_write(tls, data, datalen);
-    add_us(&s_tls_write_us, (uint64_t)(esp_timer_get_time() - start)); return ret;
+    const int64_t start = esp_timer_get_time();
+    const ssize_t ret = __real_esp_tls_conn_write(tls, data, datalen);
+    add_us(&s_tls_write_us, (uint64_t)(esp_timer_get_time() - start));
+    __atomic_store_n(&s_last_tls_write_ret, ret, __ATOMIC_RELAXED);
+    if (ret <= 0) {
+        ESP_LOGW("WS_TRANSPORT", "MIC TLS_WRITE result=%ld len=%u elapsed_us=%llu task=%s",
+                 (long)ret, (unsigned)datalen, (unsigned long long)(esp_timer_get_time() - start), pcTaskGetName(nullptr));
+    }
+    return ret;
 }
 extern "C" size_t __wrap_audio_read_mic(uint8_t *dest, size_t max_len)
 {
@@ -117,9 +141,13 @@ extern "C" BaseType_t __wrap_xQueueGenericSend(QueueHandle_t queue, const void *
     const int64_t start = esp_timer_get_time(); const BaseType_t ret = __real_xQueueGenericSend(queue, item, ticks_to_wait, copy_position);
     const uint64_t elapsed = (uint64_t)(esp_timer_get_time() - start); add_us(&s_queue_push_us, elapsed); update_max(&s_queue_push_max_us, elapsed); return ret;
 }
-extern "C" void websocket_transport_profile_snapshot(uint64_t *poll_us, uint64_t *tls_us, uint64_t *transport_us)
+extern "C" void websocket_transport_profile_snapshot(uint64_t *poll_us, uint64_t *tls_us, uint64_t *transport_us,
+                                                      int *last_poll_ret, int *last_transport_ret, ssize_t *last_tls_ret)
 {
     if (poll_us) *poll_us = load_us(&s_poll_write_us);
     if (tls_us) *tls_us = load_us(&s_tls_write_us);
     if (transport_us) *transport_us = load_us(&s_transport_write_us);
+    if (last_poll_ret) *last_poll_ret = __atomic_load_n(&s_last_poll_write_ret, __ATOMIC_RELAXED);
+    if (last_transport_ret) *last_transport_ret = __atomic_load_n(&s_last_transport_write_ret, __ATOMIC_RELAXED);
+    if (last_tls_ret) *last_tls_ret = __atomic_load_n(&s_last_tls_write_ret, __ATOMIC_RELAXED);
 }
