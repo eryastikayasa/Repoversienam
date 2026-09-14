@@ -14,14 +14,13 @@ static volatile bool s_connected = false;
 static bool s_initialized = false;
 static uint32_t s_generation = 0;
 
-/*
- * Repo3's proven TX path gives esp_websocket_client_send_text() enough time
- * to wait for transport writability. Repo6 previously used 20 ms here, which
- * is shorter than the observed poll_write latency and caused send_text() to
- * return 0 during normal MIC streaming.
- */
+/* Match Repo3's proven audio TX timing: 3000 ms write budget, one retry,
+ * 30 ms retry delay. A transient writable-transport stall must not kill the
+ * whole Gemini WebSocket session. */
 static constexpr TickType_t MIC_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
 static constexpr TickType_t NORMAL_SEND_TIMEOUT = pdMS_TO_TICKS(2000);
+static constexpr TickType_t MIC_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
+static constexpr int MIC_SEND_RETRIES = 1;
 static constexpr size_t API_KEY_MAX = 128;
 static constexpr size_t URL_MAX = 512;
 
@@ -85,18 +84,33 @@ esp_err_t websocket_transport_send_text(const char *text, size_t len)
 {
     if (!text || len == 0 || len > 8192) return ESP_ERR_INVALID_ARG;
     if (!websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
+
     const char *task_name = pcTaskGetName(nullptr);
     const bool mic_sender = task_name && strcmp(task_name, "mic_net_tx") == 0;
     const TickType_t timeout = mic_sender ? MIC_SEND_TIMEOUT : NORMAL_SEND_TIMEOUT;
-    const int sent = esp_websocket_client_send_text(s_client, text, (int)len, timeout);
-    if (sent == (int)len) return ESP_OK;
-    if (sent == 0 && mic_sender) {
-        ESP_LOGW(TAG, "MIC_NET_TX send timeout: transport writable budget expired without bytes written");
+    const int retries = mic_sender ? MIC_SEND_RETRIES : 0;
+
+    for (int attempt = 0; attempt <= retries; ++attempt) {
+        if (!websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
+        if (attempt > 0) vTaskDelay(MIC_SEND_RETRY_DELAY);
+
+        const int sent = esp_websocket_client_send_text(s_client, text, (int)len, timeout);
+        if (sent == (int)len) return ESP_OK;
+
+        ESP_LOGW(TAG, "WS send failed: attempt=%d sent=%d expected=%u timeout=%ums",
+                 attempt + 1, sent, (unsigned)len,
+                 (unsigned)(timeout * portTICK_PERIOD_MS));
+
+        if (sent < 0 && !websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
+    }
+
+    if (mic_sender) {
+        ESP_LOGW(TAG, "MIC_NET_TX send failed after retry; preserving WebSocket session");
         return ESP_ERR_TIMEOUT;
     }
-    if (sent < 0) return ESP_FAIL;
     return ESP_FAIL;
 }
+
 void websocket_transport_event_connected(void)
 {
     s_connected = true; ++s_generation;
