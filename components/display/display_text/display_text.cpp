@@ -11,10 +11,11 @@ namespace {
 constexpr int OLED_WIDTH = 128;
 constexpr int OLED_HEIGHT = 64;
 constexpr uint32_t TEXT_SCROLL_STEP_MS = 33;
+constexpr size_t TRANSCRIPT_TEXT_CAP = 512;
 
 static EXT_RAM_BSS_ATTR uint8_t s_text_buffer[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
-static char s_user_scroll_text[256] = {0};
-static char s_gemini_scroll_text[256] = {0};
+static char s_user_scroll_text[TRANSCRIPT_TEXT_CAP] = {0};
+static char s_gemini_scroll_text[TRANSCRIPT_TEXT_CAP] = {0};
 static char s_status_text[64] = {0};
 static uint16_t s_user_scroll_offset = 0;
 static uint16_t s_gemini_scroll_offset = 0;
@@ -279,17 +280,36 @@ void display_text_append_gemini(const char *text)
 
 void display_text_set_status(const char *text)
 {
+    // Status has its own storage. It must never touch transcript scroll offsets.
     portENTER_CRITICAL(&s_scroll_text_mux);
-    set_scroll_text(s_status_text, sizeof(s_status_text), text, s_user_scroll_offset);
+    set_scroll_text(s_status_text, sizeof(s_status_text), text, s_gemini_scroll_offset /* unused by status renderer */);
     portEXIT_CRITICAL(&s_scroll_text_mux);
+}
+
+bool display_text_has_user(void)
+{
+    bool has_text;
+    portENTER_CRITICAL(&s_scroll_text_mux);
+    has_text = s_user_scroll_text[0] != '\0';
+    portEXIT_CRITICAL(&s_scroll_text_mux);
+    return has_text;
+}
+
+bool display_text_has_gemini(void)
+{
+    bool has_text;
+    portENTER_CRITICAL(&s_scroll_text_mux);
+    has_text = s_gemini_scroll_text[0] != '\0';
+    portEXIT_CRITICAL(&s_scroll_text_mux);
+    return has_text;
 }
 
 void display_text_render_user(void)
 {
-    char text[256] = {0};
+    char text[TRANSCRIPT_TEXT_CAP] = {0};
     uint16_t offset = 0;
     portENTER_CRITICAL(&s_scroll_text_mux);
-    strncpy(text, s_user_scroll_text, sizeof(text) - 1);
+    memcpy(text, s_user_scroll_text, sizeof(text));
     offset = s_user_scroll_offset;
     portEXIT_CRITICAL(&s_scroll_text_mux);
 
@@ -300,10 +320,10 @@ void display_text_render_user(void)
 
 void display_text_render_gemini(void)
 {
-    char text[256] = {0};
+    char text[TRANSCRIPT_TEXT_CAP] = {0};
     uint16_t offset = 0;
     portENTER_CRITICAL(&s_scroll_text_mux);
-    strncpy(text, s_gemini_scroll_text, sizeof(text) - 1);
+    memcpy(text, s_gemini_scroll_text, sizeof(text));
     offset = s_gemini_scroll_offset;
     portEXIT_CRITICAL(&s_scroll_text_mux);
 
@@ -316,7 +336,7 @@ void display_text_render_status(void)
 {
     char text[64] = {0};
     portENTER_CRITICAL(&s_scroll_text_mux);
-    strncpy(text, s_status_text, sizeof(text) - 1);
+    memcpy(text, s_status_text, sizeof(text));
     portEXIT_CRITICAL(&s_scroll_text_mux);
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
