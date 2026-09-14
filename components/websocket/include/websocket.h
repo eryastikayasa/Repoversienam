@@ -22,6 +22,11 @@ extern "C" {
 void websocket_init(void);
 bool websocket_connect(void);
 void websocket_disconnect(void);
+
+/* End only the currently active Gemini session. This is not persistent
+ * standby mode; the normal disconnect lifecycle will re-arm Wake Word. */
+void websocket_end_session(void);
+
 bool websocket_is_connected(void);
 
 /* Audio payload is always PCM16/16kHz/mono/LE at this boundary. */
