@@ -13,6 +13,11 @@ static volatile bool s_connected = false;
 static bool s_initialized = false;
 static uint32_t s_generation = 0;
 
+/* A MIC frame is 20 ms of audio. The network sender must never wait on the
+ * websocket transport longer than one frame period; congestion is handled by
+ * the bounded MIC sender queue instead of stalling AudioEngine's mic_tx task. */
+static constexpr TickType_t MIC_SEND_TIMEOUT = pdMS_TO_TICKS(20);
+
 static constexpr size_t API_KEY_MAX = 128;
 static constexpr size_t URL_MAX = 512;
 
@@ -96,7 +101,7 @@ esp_err_t websocket_transport_send_text(const char *text, size_t len)
 {
     if (!text || len == 0 || len > 8192) return ESP_ERR_INVALID_ARG;
     if (!websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
-    const int sent = esp_websocket_client_send_text(s_client, text, (int)len, pdMS_TO_TICKS(2000));
+    const int sent = esp_websocket_client_send_text(s_client, text, (int)len, MIC_SEND_TIMEOUT);
     return sent == (int)len ? ESP_OK : ESP_FAIL;
 }
 
