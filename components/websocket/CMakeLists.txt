@@ -8,6 +8,7 @@ idf_component_register(
         "gemini/gemini_protocol.cpp"
         "gemini/gemini_message.cpp"
         "gemini/gemini_audio.cpp"
+        "gemini/gemini_tool.cpp"
     INCLUDE_DIRS
         "include"
         "gemini"
@@ -19,6 +20,7 @@ idf_component_register(
         audio_hal
         web_config
         cjson
+        uart_control
 )
 
 # Diagnostic-only linker wrappers. These measure the actual synchronous
