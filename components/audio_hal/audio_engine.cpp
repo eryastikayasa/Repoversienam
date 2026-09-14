@@ -1,6 +1,6 @@
 #include "audio_engine.h"
 #include "audio_hal.h"
-#include "display_face.h"
+#include "display_engine.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -169,7 +169,11 @@ static void playback_task(void *arg)
                 started = false;
                 s_turn.model_complete = false;
                 set_state(AUDIO_ENGINE_COMPLETE);
-                display_face_set_state(FACE_LISTENING);
+                if (start_input_after_drain) {
+                    display_set_system_state(FACE_LISTENING, "Mendengarkan...");
+                } else {
+                    display_set_system_state(FACE_IDLE, "Siap - ucap HI ESP");
+                }
                 set_state(AUDIO_ENGINE_IDLE);
                 if (start_input_after_drain) {
                     audio_engine_start_input_session();
@@ -195,7 +199,7 @@ static void playback_task(void *arg)
             started = true;
             s_turn.playback_started = true;
             set_state(AUDIO_ENGINE_PLAYING);
-            display_face_set_state(FACE_SPEAKING);
+            display_set_system_state(FACE_SPEAKING, "Berbicara...");
         }
 
         const size_t played = audio_write_speaker(pcm, got);
@@ -244,6 +248,7 @@ bool audio_engine_init(void)
     if (!s_stream_mem) {
         ESP_LOGE(TAG, "Audio ring allocation gagal: %uB", (unsigned)RING_BYTES);
         s_state = AUDIO_ENGINE_ERROR;
+        display_set_system_state(FACE_ERROR, "Audio gagal");
         return false;
     }
 
@@ -252,6 +257,7 @@ bool audio_engine_init(void)
     if (!s_stream || !s_lock) {
         ESP_LOGE(TAG, "Audio stream/mutex init gagal");
         s_state = AUDIO_ENGINE_ERROR;
+        display_set_system_state(FACE_ERROR, "Audio gagal");
         return false;
     }
 
@@ -259,6 +265,7 @@ bool audio_engine_init(void)
     if (xTaskCreatePinnedToCore(playback_task, "audio_playback", 4096, nullptr, 4, &s_playback_task, 0) != pdPASS) {
         ESP_LOGE(TAG, "Playback task create gagal");
         s_state = AUDIO_ENGINE_ERROR;
+        display_set_system_state(FACE_ERROR, "Audio gagal");
         return false;
     }
 
@@ -329,6 +336,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             break;
         case AUDIO_ENGINE_EVENT_ERROR:
             set_state(AUDIO_ENGINE_ERROR);
+            display_set_system_state(FACE_ERROR, "Audio gagal");
             break;
         default:
             break;
