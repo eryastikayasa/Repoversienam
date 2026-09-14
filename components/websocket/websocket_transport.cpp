@@ -13,6 +13,10 @@ static volatile bool s_connected = false;
 static bool s_initialized = false;
 static uint32_t s_generation = 0;
 
+extern "C" void websocket_transport_profile_snapshot(uint64_t *poll_us,
+                                                       uint64_t *tls_us,
+                                                       uint64_t *transport_us);
+
 static constexpr size_t API_KEY_MAX = 128;
 static constexpr size_t URL_MAX = 512;
 
@@ -96,7 +100,26 @@ esp_err_t websocket_transport_send_text(const char *text, size_t len)
 {
     if (!text || len == 0 || len > 8192) return ESP_ERR_INVALID_ARG;
     if (!websocket_transport_is_connected()) return ESP_ERR_INVALID_STATE;
+
+    uint64_t poll_before = 0;
+    uint64_t tls_before = 0;
+    uint64_t transport_before = 0;
+    websocket_transport_profile_snapshot(&poll_before, &tls_before, &transport_before);
+
     const int sent = esp_websocket_client_send_text(s_client, text, (int)len, pdMS_TO_TICKS(2000));
+
+    uint64_t poll_after = 0;
+    uint64_t tls_after = 0;
+    uint64_t transport_after = 0;
+    websocket_transport_profile_snapshot(&poll_after, &tls_after, &transport_after);
+
+    ESP_LOGD(TAG,
+             "MIC transport stage: poll=%llu us tls=%llu us transport=%llu us total_send=%llu us",
+             (unsigned long long)(poll_after - poll_before),
+             (unsigned long long)(tls_after - tls_before),
+             (unsigned long long)(transport_after - transport_before),
+             (unsigned long long)0ULL);
+
     return sent == (int)len ? ESP_OK : ESP_FAIL;
 }
 
