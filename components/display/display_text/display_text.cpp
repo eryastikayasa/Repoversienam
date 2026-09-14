@@ -19,6 +19,7 @@ static char s_gemini_scroll_text[TRANSCRIPT_TEXT_CAP] = {0};
 static char s_status_text[64] = {0};
 static uint16_t s_user_scroll_offset = 0;
 static uint16_t s_gemini_scroll_offset = 0;
+static uint16_t s_status_scroll_offset = 0;
 static uint32_t s_last_update_ms = 0;
 static portMUX_TYPE s_scroll_text_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -90,7 +91,6 @@ static void draw_scrolling_text(const char *text, uint16_t offset, int text_x)
     const size_t len = strlen(text);
     const int text_px = (int)len * CHAR_WIDTH;
     const int visible_width = TEXT_RIGHT - text_x + 1;
-
     if (visible_width <= 5) return;
 
     if (text_px <= visible_width) {
@@ -101,7 +101,6 @@ static void draw_scrolling_text(const char *text, uint16_t offset, int text_x)
 
     const int cycle_px = text_px + GAP_PX;
     int pos = TEXT_RIGHT + 1 - (int)offset;
-
     for (size_t i = 0; i < len; ++i) {
         const int x = pos + (int)i * CHAR_WIDTH;
         if (x + 5 >= text_x && x <= TEXT_RIGHT) draw_text_char(x, TEXT_Y, text[i]);
@@ -138,7 +137,6 @@ static void append_scroll_text(char *dst, size_t dst_size, const char *text)
         dst[out++] = ' ';
         dst[out] = '\0';
     }
-
     for (size_t i = 0; text[i] != '\0' && out + 1 < dst_size; ++i) {
         unsigned char c = (unsigned char)text[i];
         if (c >= 0x20 && c <= 0x7E) dst[out++] = (char)c;
@@ -156,10 +154,8 @@ static void draw_rssi_char(int x, int y, char c)
         {0x0E,0x15,0x15,0x15,0x08}, {0x01,0x01,0x19,0x05,0x03},
         {0x0A,0x15,0x15,0x15,0x0A}, {0x02,0x15,0x15,0x15,0x0E},
     };
-
     int index = (c == '-') ? 0 : (c - '0' + 1);
     if (index < 0 || index >= (int)(sizeof(glyphs) / sizeof(glyphs[0]))) return;
-
     for (int col = 0; col < 5; ++col) {
         uint8_t bits = glyphs[index][col];
         for (int row = 0; row < 5; ++row) {
@@ -177,14 +173,11 @@ static int draw_rssi(void)
 {
     wifi_ap_record_t ap_info = {};
     if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) return 0;
-
     int rssi = ap_info.rssi;
     if (rssi > 0) rssi = 0;
     if (rssi < -99) rssi = -99;
-
     char text[5];
     snprintf(text, sizeof(text), "%d", rssi);
-
     const int char_width = 6;
     int x = 0;
     const int y = OLED_HEIGHT - 5;
@@ -198,13 +191,11 @@ static int draw_rssi(void)
 static uint16_t advance_scroll_offset(const char *text, uint16_t offset, uint32_t steps)
 {
     if (!text || !text[0]) return 0;
-
     constexpr uint16_t CHAR_WIDTH = 6;
     constexpr uint16_t GAP_PX = 12;
     const uint32_t text_px = (uint32_t)strlen(text) * CHAR_WIDTH;
     const uint32_t visible_width = OLED_WIDTH - 1 - 4 + 1;
     if (text_px <= visible_width) return 0;
-
     const uint32_t cycle_px = text_px + GAP_PX;
     return (uint16_t)((offset + steps) % cycle_px);
 }
@@ -220,6 +211,7 @@ void display_text_init(void)
     s_status_text[0] = '\0';
     s_user_scroll_offset = 0;
     s_gemini_scroll_offset = 0;
+    s_status_scroll_offset = 0;
     s_last_update_ms = 0;
     portEXIT_CRITICAL(&s_scroll_text_mux);
 }
@@ -227,25 +219,20 @@ void display_text_init(void)
 void display_text_update(uint32_t now_ms)
 {
     portENTER_CRITICAL(&s_scroll_text_mux);
-
     if (s_last_update_ms == 0) {
         s_last_update_ms = now_ms;
         portEXIT_CRITICAL(&s_scroll_text_mux);
         return;
     }
-
     const uint32_t elapsed_ms = now_ms - s_last_update_ms;
     const uint32_t steps = elapsed_ms / TEXT_SCROLL_STEP_MS;
     if (steps == 0) {
         portEXIT_CRITICAL(&s_scroll_text_mux);
         return;
     }
-
-    s_user_scroll_offset = advance_scroll_offset(
-        s_user_scroll_text, s_user_scroll_offset, steps);
-    s_gemini_scroll_offset = advance_scroll_offset(
-        s_gemini_scroll_text, s_gemini_scroll_offset, steps);
-
+    s_user_scroll_offset = advance_scroll_offset(s_user_scroll_text, s_user_scroll_offset, steps);
+    s_gemini_scroll_offset = advance_scroll_offset(s_gemini_scroll_text, s_gemini_scroll_offset, steps);
+    s_status_scroll_offset = advance_scroll_offset(s_status_text, s_status_scroll_offset, steps);
     s_last_update_ms += steps * TEXT_SCROLL_STEP_MS;
     portEXIT_CRITICAL(&s_scroll_text_mux);
 }
@@ -280,9 +267,8 @@ void display_text_append_gemini(const char *text)
 
 void display_text_set_status(const char *text)
 {
-    // Status has its own storage. It must never touch transcript scroll offsets.
     portENTER_CRITICAL(&s_scroll_text_mux);
-    set_scroll_text(s_status_text, sizeof(s_status_text), text, s_gemini_scroll_offset /* unused by status renderer */);
+    set_scroll_text(s_status_text, sizeof(s_status_text), text, s_status_scroll_offset);
     portEXIT_CRITICAL(&s_scroll_text_mux);
 }
 
@@ -306,12 +292,13 @@ bool display_text_has_gemini(void)
 
 void display_text_render_user(void)
 {
-    char text[TRANSCRIPT_TEXT_CAP] = {0};
+    char text[256] = {0};
     uint16_t offset = 0;
     portENTER_CRITICAL(&s_scroll_text_mux);
     memcpy(text, s_user_scroll_text, sizeof(text));
     offset = s_user_scroll_offset;
     portEXIT_CRITICAL(&s_scroll_text_mux);
+    text[sizeof(text) - 1] = '\0';
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
@@ -320,12 +307,13 @@ void display_text_render_user(void)
 
 void display_text_render_gemini(void)
 {
-    char text[TRANSCRIPT_TEXT_CAP] = {0};
+    char text[256] = {0};
     uint16_t offset = 0;
     portENTER_CRITICAL(&s_scroll_text_mux);
     memcpy(text, s_gemini_scroll_text, sizeof(text));
     offset = s_gemini_scroll_offset;
     portEXIT_CRITICAL(&s_scroll_text_mux);
+    text[sizeof(text) - 1] = '\0';
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
@@ -338,21 +326,17 @@ void display_text_render_status(void)
     portENTER_CRITICAL(&s_scroll_text_mux);
     memcpy(text, s_status_text, sizeof(text));
     portEXIT_CRITICAL(&s_scroll_text_mux);
+    text[sizeof(text) - 1] = '\0';
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
-
     constexpr int CHAR_WIDTH = 6;
     constexpr int TEXT_Y = OLED_HEIGHT - 5;
     const size_t len = strlen(text);
     const int max_chars = OLED_WIDTH / CHAR_WIDTH;
     const int chars_to_draw = len < (size_t)max_chars ? (int)len : max_chars;
-
     int x = (OLED_WIDTH - chars_to_draw * CHAR_WIDTH) / 2;
     if (x < 0) x = 0;
-
-    for (int i = 0; i < chars_to_draw; ++i) {
-        draw_text_char(x + i * CHAR_WIDTH, TEXT_Y, text[i]);
-    }
+    for (int i = 0; i < chars_to_draw; ++i) draw_text_char(x + i * CHAR_WIDTH, TEXT_Y, text[i]);
 }
 
 const uint8_t *display_text_buffer(void)
