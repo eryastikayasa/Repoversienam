@@ -7,6 +7,7 @@ extern "C" gemini_message_type_t gemini_message_classify_root(const cJSON *root)
 
     if (cJSON_GetObjectItemCaseSensitive(root, "error")) return GEMINI_MESSAGE_ERROR;
     if (cJSON_GetObjectItemCaseSensitive(root, "setupComplete")) return GEMINI_MESSAGE_SETUP;
+    if (cJSON_GetObjectItemCaseSensitive(root, "toolCall")) return GEMINI_MESSAGE_TOOL_CALL;
     if (cJSON_GetObjectItemCaseSensitive(root, "serverContent")) return GEMINI_MESSAGE_SERVER_CONTENT;
     if (cJSON_GetObjectItemCaseSensitive(root, "sessionResumptionUpdate")) return GEMINI_MESSAGE_SESSION_RESUMPTION;
     if (cJSON_GetObjectItemCaseSensitive(root, "goAway")) return GEMINI_MESSAGE_GOAWAY;
