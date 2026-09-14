@@ -178,7 +178,8 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
 {
     if (!json || len == 0) return false;
 
-    const int64_t parse_start_us = esp_timer_get_time();
+    const int64_t total_start_us = esp_timer_get_time();
+    const int64_t parse_start_us = total_start_us;
     cJSON *root = cJSON_ParseWithLength(json, len);
     const uint32_t parse_us = (uint32_t)(esp_timer_get_time() - parse_start_us);
     if (!root) {
@@ -233,8 +234,10 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
         }
     }
 
-    // Profiling is intentionally sampled, not logged for every audio chunk.
-    static int64_t last_profile_us = 0;
+    const uint32_t total_us = (uint32_t)(esp_timer_get_time() - total_start_us);
+    // Keep this profiling path sampled/aggregated so UART logging does not
+    // become part of the realtime hot path.
+    static int64_t profile_last_us = 0;
     static uint64_t profile_count = 0;
     static uint64_t profile_parse_us = 0;
     static uint64_t profile_classify_us = 0;
@@ -242,17 +245,16 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
     ++profile_count;
     profile_parse_us += parse_us;
     profile_classify_us += classify_us;
-    const int64_t profile_now_us = esp_timer_get_time();
-    if (!last_profile_us) last_profile_us = profile_now_us;
-    const uint32_t total_so_far_us = (uint32_t)(profile_now_us - (profile_now_us - parse_us));
-    profile_total_us += total_so_far_us;
-    if (profile_now_us - last_profile_us >= 5000000LL) {
+    profile_total_us += total_us;
+    const int64_t now_us = esp_timer_get_time();
+    if (!profile_last_us) profile_last_us = now_us;
+    if (now_us - profile_last_us >= 5000000LL) {
         ESP_LOGI(TAG, "RX_PROFILE: count=%llu json=%llu us avg classify=%llu us avg total=%llu us avg",
                  (unsigned long long)profile_count,
                  (unsigned long long)(profile_parse_us / profile_count),
                  (unsigned long long)(profile_classify_us / profile_count),
                  (unsigned long long)(profile_total_us / profile_count));
-        last_profile_us = profile_now_us;
+        profile_last_us = now_us;
         profile_count = 0;
         profile_parse_us = 0;
         profile_classify_us = 0;
