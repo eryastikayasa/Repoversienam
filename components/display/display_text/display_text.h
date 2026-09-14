@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,6 +14,8 @@ void display_text_set_gemini(const char *text);
 void display_text_append_user(const char *text);
 void display_text_append_gemini(const char *text);
 void display_text_set_status(const char *text);
+bool display_text_has_user(void);
+bool display_text_has_gemini(void);
 void display_text_render_user(void);
 void display_text_render_gemini(void);
 void display_text_render_status(void);

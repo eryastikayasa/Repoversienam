@@ -5,6 +5,7 @@
 #include "web_config.h"
 #include "audio_engine.h"
 #include "display_engine.h"
+#include "display_text.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "cJSON.h"
@@ -23,6 +24,13 @@ static char s_setup_role[2048] = {0};
 static char s_setup_json[8192] = {0};
 static uint64_t s_goaway_ms = 0;
 
+static char s_user_transcript[512] = {0};
+static char s_user_interim[512] = {0};
+static char s_gemini_transcript[512] = {0};
+static bool s_user_turn_active = false;
+static bool s_gemini_turn_active = false;
+static bool s_user_needs_new_turn = true;
+
 static bool json_string(cJSON *object, const char *key, char *out, size_t cap)
 {
     if (!cJSON_IsObject(object) || !key || !out || cap < 2) return false;
@@ -32,6 +40,100 @@ static bool json_string(cJSON *object, const char *key, char *out, size_t cap)
     if (len + 1U > cap) return false;
     memcpy(out, item->valuestring, len + 1U);
     return true;
+}
+
+static void copy_text(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t len = strlen(src);
+    if (len >= cap) len = cap - 1U;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+static void clear_user_transcript(void)
+{
+    s_user_transcript[0] = '\0';
+    s_user_interim[0] = '\0';
+    s_user_turn_active = false;
+    display_text_set_user("");
+}
+
+static void clear_gemini_transcript(void)
+{
+    s_gemini_transcript[0] = '\0';
+    s_gemini_turn_active = false;
+    display_text_set_gemini("");
+}
+
+// Handles both cumulative partials ("halo" -> "halo apa") and delta-like
+// fragments ("halo" -> "apa"), without duplicating cumulative text.
+static void merge_transcript(char *dst, size_t cap, const char *incoming)
+{
+    if (!dst || cap == 0 || !incoming || !incoming[0]) return;
+    while (*incoming == ' ' || *incoming == '\n' || *incoming == '\r' || *incoming == '\t') ++incoming;
+    if (!incoming[0]) return;
+
+    const size_t current_len = strlen(dst);
+    const size_t incoming_len = strlen(incoming);
+    if (current_len == 0) { copy_text(dst, cap, incoming); return; }
+    if (strcmp(dst, incoming) == 0) return;
+
+    if (incoming_len >= current_len && strncmp(incoming, dst, current_len) == 0) {
+        copy_text(dst, cap, incoming);
+        return;
+    }
+    if (current_len >= incoming_len && strncmp(dst, incoming, incoming_len) == 0) return;
+
+    size_t out = current_len;
+    if (out + 1U < cap && out > 0 && dst[out - 1U] != ' ' && incoming[0] != ' ')
+        dst[out++] = ' ';
+    while (*incoming && out + 1U < cap) dst[out++] = *incoming++;
+    dst[out] = '\0';
+}
+
+static void publish_user_text(void)
+{
+    char combined[512] = {0};
+    copy_text(combined, sizeof(combined), s_user_transcript);
+    if (s_user_interim[0]) merge_transcript(combined, sizeof(combined), s_user_interim);
+    display_text_set_user(combined);
+}
+
+static void handle_input_transcription(const char *text, bool interim)
+{
+    if (!text || !text[0]) return;
+
+    if (!s_user_turn_active) {
+        if (s_user_needs_new_turn) {
+            clear_user_transcript();
+            s_user_needs_new_turn = false;
+        }
+        s_user_turn_active = true;
+    }
+
+    if (interim) {
+        copy_text(s_user_interim, sizeof(s_user_interim), text);
+    } else {
+        merge_transcript(s_user_transcript, sizeof(s_user_transcript), text);
+        s_user_interim[0] = '\0';
+        // Final transcript closes this speech segment. A future interim/final
+        // after the turn boundary starts a fresh visible user transcript.
+        s_user_turn_active = false;
+    }
+    publish_user_text();
+}
+
+static void handle_output_transcription(const char *text)
+{
+    if (!text || !text[0]) return;
+    if (!s_gemini_turn_active) {
+        clear_gemini_transcript();
+        s_gemini_turn_active = true;
+    }
+    merge_transcript(s_gemini_transcript, sizeof(s_gemini_transcript), text);
+    display_text_set_gemini(s_gemini_transcript);
 }
 
 static void parse_goaway(cJSON *root)
@@ -82,10 +184,12 @@ static bool build_setup(void)
     cJSON *realtime = cJSON_CreateObject();
     cJSON *aad_config = cJSON_CreateObject();
     cJSON *session = cJSON_CreateObject();
-    if (!root || !setup || !generation || !modalities || !speech || !voice || !prebuilt || !realtime || !aad_config || !session) {
+    cJSON *input_transcription = cJSON_CreateObject();
+    cJSON *output_transcription = cJSON_CreateObject();
+    if (!root || !setup || !generation || !modalities || !speech || !voice || !prebuilt || !realtime || !aad_config || !session || !input_transcription || !output_transcription) {
         cJSON_Delete(root); cJSON_Delete(setup); cJSON_Delete(generation); cJSON_Delete(modalities);
         cJSON_Delete(speech); cJSON_Delete(voice); cJSON_Delete(prebuilt); cJSON_Delete(realtime);
-        cJSON_Delete(aad_config); cJSON_Delete(session);
+        cJSON_Delete(aad_config); cJSON_Delete(session); cJSON_Delete(input_transcription); cJSON_Delete(output_transcription);
         return false;
     }
 
@@ -126,7 +230,8 @@ static bool build_setup(void)
         ok = ok && add_setup_string(part, "text", s_setup_role);
     }
 
-    ok = ok && cJSON_AddItemToObject(setup, "inputAudioTranscription", cJSON_CreateObject());
+    ok = ok && cJSON_AddItemToObject(setup, "inputAudioTranscription", input_transcription);
+    ok = ok && cJSON_AddItemToObject(setup, "outputAudioTranscription", output_transcription);
     ok = ok && cJSON_AddItemToObject(setup, "sessionResumption", session);
     if (s_resume_available) ok = ok && add_setup_string(session, "handle", s_resume_handle);
     if (!ok) { cJSON_Delete(root); return false; }
@@ -160,6 +265,14 @@ bool gemini_protocol_on_connected(void)
     s_greeting_finished = false;
     s_resume_attempted = false;
     s_goaway_ms = 0;
+    s_user_needs_new_turn = true;
+    s_user_turn_active = false;
+    s_gemini_turn_active = false;
+    s_user_transcript[0] = '\0';
+    s_user_interim[0] = '\0';
+    s_gemini_transcript[0] = '\0';
+    display_text_set_user("");
+    display_text_set_gemini("");
     if (!build_setup()) { ESP_LOGE(TAG, "Gemini setup JSON gagal dibuat"); return false; }
     const size_t len = strlen(s_setup_json);
     if (websocket_transport_send_text(s_setup_json, len) != ESP_OK) { ESP_LOGE(TAG, "Gemini setup gagal dikirim"); return false; }
@@ -173,6 +286,9 @@ void gemini_protocol_on_disconnected(void)
 {
     s_setup_complete = false; s_greeting_sent = false; s_greeting_finished = false;
     s_goaway_ms = 0; s_resume_attempted = false;
+    s_user_needs_new_turn = true;
+    s_user_turn_active = false;
+    s_gemini_turn_active = false;
 }
 
 bool gemini_protocol_process_message(const char *json, size_t len, uint32_t generation)
@@ -203,15 +319,47 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
             if (!send_greeting()) ESP_LOGW(TAG, "WS_GEMINI: Greeting JSON gagal dikirim");
         }
         break;
-    case GEMINI_MESSAGE_SERVER_CONTENT:
-        /* After the greeting turn, the next server-content event is the real
-         * Gemini response path. Mark THINKING from the actual server event;
-         * playback switches the face to SPEAKING when PCM reaches the speaker. */
-        if (s_greeting_finished) {
+    case GEMINI_MESSAGE_SERVER_CONTENT: {
+        cJSON *server = cJSON_GetObjectItemCaseSensitive(root, "serverContent");
+        if (!cJSON_IsObject(server)) {
+            handled = gemini_audio_process_server_root(root, generation);
+            break;
+        }
+
+        cJSON *interim_input = cJSON_GetObjectItemCaseSensitive(server, "interimInputTranscription");
+        cJSON *input = cJSON_GetObjectItemCaseSensitive(server, "inputTranscription");
+        cJSON *output = cJSON_GetObjectItemCaseSensitive(server, "outputTranscription");
+
+        if (cJSON_IsObject(interim_input)) {
+            cJSON *text = cJSON_GetObjectItemCaseSensitive(interim_input, "text");
+            if (cJSON_IsString(text) && text->valuestring) handle_input_transcription(text->valuestring, true);
+        }
+        if (cJSON_IsObject(input)) {
+            cJSON *text = cJSON_GetObjectItemCaseSensitive(input, "text");
+            if (cJSON_IsString(text) && text->valuestring) handle_input_transcription(text->valuestring, false);
+        }
+        if (cJSON_IsObject(output)) {
+            cJSON *text = cJSON_GetObjectItemCaseSensitive(output, "text");
+            if (cJSON_IsString(text) && text->valuestring) handle_output_transcription(text->valuestring);
+        }
+
+        if (s_greeting_finished && !cJSON_IsObject(output)) {
             display_set_system_state(FACE_THINKING, "Berpikir...");
         }
         handled = gemini_audio_process_server_root(root, generation);
+
+        const bool interrupted = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(server, "interrupted"));
+        const bool generation_complete = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(server, "generationComplete"));
+        const bool turn_complete = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(server, "turnComplete"));
+        if (interrupted) {
+            s_gemini_turn_active = false;
+            s_user_needs_new_turn = true;
+        } else if (generation_complete || turn_complete) {
+            s_gemini_turn_active = false;
+            s_user_needs_new_turn = true;
+        }
         break;
+    }
     case GEMINI_MESSAGE_SESSION_RESUMPTION: {
         cJSON *update = cJSON_GetObjectItemCaseSensitive(root, "sessionResumptionUpdate");
         const bool resumable = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(update, "resumable"));
@@ -244,8 +392,6 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
     }
 
     const uint32_t total_us = (uint32_t)(esp_timer_get_time() - total_start_us);
-    // Keep this profiling path sampled/aggregated so UART logging does not
-    // become part of the realtime hot path.
     static int64_t profile_last_us = 0;
     static uint64_t profile_count = 0;
     static uint64_t profile_parse_us = 0;
