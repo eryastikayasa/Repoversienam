@@ -24,6 +24,11 @@ static QueueHandle_t s_mic_net_queue = nullptr;
 static TaskHandle_t s_mic_net_task = nullptr;
 static uint32_t s_mic_net_queue_drops = 0;
 static uint32_t s_mic_net_queue_high = 0;
+static uint32_t s_send_ok = 0;
+static uint32_t s_send_timeout = 0;
+static uint32_t s_send_return_zero = 0;
+static uint32_t s_send_transport_error = 0;
+static uint32_t s_send_invalid_state = 0;
 static char s_audio_b64[1024];
 static char s_audio_json[1200];
 static uint64_t s_profile_last_us = 0, s_profile_count = 0;
@@ -74,7 +79,7 @@ static void profile_record(uint32_t encode_us, uint32_t json_us, uint32_t poll_u
     if (now_us - s_profile_last_us < 5000000ULL || s_profile_count == 0) return;
     const uint64_t count = s_profile_count;
     ESP_LOGI(TAG,
-        "MIC_TX_PROFILE: count=%llu encode_avg_us=%llu encode_max_us=%llu json_avg_us=%llu json_max_us=%llu poll_write_avg_us=%llu poll_write_max_us=%llu tls_write_avg_us=%llu tls_write_max_us=%llu transport_write_avg_us=%llu transport_write_max_us=%llu send_avg_us=%llu send_max_us=%llu total_avg_us=%llu total_max_us=%llu net_queue_high=%u net_queue_drops=%u net_stack_watermark=%uB",
+        "MIC_TX_PROFILE: count=%llu encode_avg_us=%llu encode_max_us=%llu json_avg_us=%llu json_max_us=%llu poll_write_avg_us=%llu poll_write_max_us=%llu tls_write_avg_us=%llu tls_write_max_us=%llu transport_write_avg_us=%llu transport_write_max_us=%llu send_avg_us=%llu send_max_us=%llu total_avg_us=%llu total_max_us=%llu net_queue_high=%u net_queue_drops=%u send_ok=%u send_timeout=%u send_return_zero=%u send_transport_error=%u send_invalid_state=%u net_stack_watermark=%uB",
         (unsigned long long)count,
         (unsigned long long)(s_profile_encode_us / count), (unsigned long long)s_profile_encode_max_us,
         (unsigned long long)(s_profile_json_us / count), (unsigned long long)s_profile_json_max_us,
@@ -84,6 +89,8 @@ static void profile_record(uint32_t encode_us, uint32_t json_us, uint32_t poll_u
         (unsigned long long)(s_profile_send_us / count), (unsigned long long)s_profile_send_max_us,
         (unsigned long long)(s_profile_total_us / count), (unsigned long long)s_profile_total_max_us,
         (unsigned)s_mic_net_queue_high, (unsigned)s_mic_net_queue_drops,
+        (unsigned)s_send_ok, (unsigned)s_send_timeout, (unsigned)s_send_return_zero,
+        (unsigned)s_send_transport_error, (unsigned)s_send_invalid_state,
         s_mic_net_task ? (unsigned)(uxTaskGetStackHighWaterMark(s_mic_net_task) * sizeof(StackType_t)) : 0U);
     s_profile_last_us = now_us; s_profile_count = 0;
     s_profile_encode_us = s_profile_encode_max_us = 0;
@@ -94,6 +101,8 @@ static void profile_record(uint32_t encode_us, uint32_t json_us, uint32_t poll_u
     s_profile_send_us = s_profile_send_max_us = 0;
     s_profile_total_us = s_profile_total_max_us = 0;
     s_mic_net_queue_high = 0; s_mic_net_queue_drops = 0;
+    s_send_ok = s_send_timeout = s_send_return_zero = 0;
+    s_send_transport_error = s_send_invalid_state = 0;
     log_mic_net_stack("profile");
 }
 static bool send_frame_network(const uint8_t *data, size_t len)
@@ -114,7 +123,7 @@ static bool send_frame_network(const uint8_t *data, size_t len)
     uint64_t poll_before = 0, tls_before = 0, transport_before = 0;
     websocket_transport_profile_snapshot(&poll_before, &tls_before, &transport_before);
     const int64_t send_start = esp_timer_get_time();
-    const bool sent = websocket_transport_send_text(s_audio_json, (size_t)n) == ESP_OK;
+    const esp_err_t send_result = websocket_transport_send_text(s_audio_json, (size_t)n);
     const uint32_t send_us = (uint32_t)(esp_timer_get_time() - send_start);
     uint64_t poll_after = 0, tls_after = 0, transport_after = 0;
     websocket_transport_profile_snapshot(&poll_after, &tls_after, &transport_after);
@@ -122,8 +131,27 @@ static bool send_frame_network(const uint8_t *data, size_t len)
     profile_record(encode_us, json_us, (uint32_t)(poll_after - poll_before),
                    (uint32_t)(tls_after - tls_before), (uint32_t)(transport_after - transport_before),
                    send_us, total_us);
-    if (!sent) { ESP_LOGW(TAG, "MIC_NET_TX: bounded send failed/timeout; stopping MIC input session"); audio_engine_stop_input_session(); }
-    return sent;
+    if (send_result == ESP_OK) {
+        ++s_send_ok;
+        return true;
+    }
+    if (send_result == ESP_ERR_TIMEOUT) {
+        ++s_send_timeout;
+        ++s_send_return_zero;
+        ESP_LOGW(TAG, "MIC_NET_TX: SEND_TIMEOUT after %uus; stopping MIC session and aborting WebSocket", (unsigned)send_us);
+    } else if (send_result == ESP_ERR_INVALID_STATE) {
+        ++s_send_invalid_state;
+        ESP_LOGW(TAG, "MIC_NET_TX: SEND_INVALID_STATE; stopping MIC session");
+    } else {
+        ++s_send_transport_error;
+        ESP_LOGW(TAG, "MIC_NET_TX: SEND_TRANSPORT_ERROR after %uus; stopping MIC session and aborting WebSocket", (unsigned)send_us);
+    }
+    audio_engine_stop_input_session();
+    bool stopped = audio_engine_stop_capture_and_wait();
+    if (!stopped) stopped = audio_engine_stop_capture_and_wait();
+    if (!stopped) ESP_LOGE(TAG, "MIC_NET_TX: capture cleanup did not complete within bounded wait");
+    if (send_result != ESP_ERR_INVALID_STATE) (void)websocket_transport_abort();
+    return false;
 }
 static void mic_network_task(void *arg)
 {
