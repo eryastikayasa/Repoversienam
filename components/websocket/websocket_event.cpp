@@ -3,6 +3,7 @@
 #include "websocket_audio.h"
 #include "gemini_protocol.h"
 #include "audio_engine.h"
+#include "display_engine.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -146,14 +147,17 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t 
     case WEBSOCKET_EVENT_CONNECTED:
         websocket_transport_event_connected(); websocket_event_reset(); (void)ensure_rx_worker();
         audio_engine_notify(AUDIO_ENGINE_EVENT_GENERATION_CHANGED, websocket_transport_generation());
-        if (!gemini_protocol_on_connected()) { ESP_LOGE(TAG, "Gemini setup send failed"); (void)websocket_transport_disconnect(); }
+        if (!gemini_protocol_on_connected()) { ESP_LOGE(TAG, "Gemini setup send failed"); display_set_system_state(FACE_ERROR, "Gemini gagal"); (void)websocket_transport_disconnect(); }
         break;
     case WEBSOCKET_EVENT_DATA:
         if (websocket_transport_is_connected()) handle_data_event(static_cast<esp_websocket_event_data_t *>(event_data));
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         websocket_audio_on_disconnected(); audio_engine_stop_input_session(); gemini_protocol_on_disconnected(); reset_rx(); websocket_transport_event_disconnected(); break;
-    case WEBSOCKET_EVENT_ERROR: ESP_LOGE(TAG, "WebSocket ERROR"); break;
+    case WEBSOCKET_EVENT_ERROR:
+        ESP_LOGE(TAG, "WebSocket ERROR");
+        display_set_system_state(FACE_ERROR, "WebSocket error");
+        break;
     default: break;
     }
 }

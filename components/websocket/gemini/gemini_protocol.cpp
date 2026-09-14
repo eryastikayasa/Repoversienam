@@ -4,6 +4,7 @@
 #include "websocket_transport.h"
 #include "web_config.h"
 #include "audio_engine.h"
+#include "display_engine.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "cJSON.h"
@@ -198,10 +199,17 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
             s_setup_complete = true;
             ESP_LOGI(TAG, "GEMINI_PROTO: Gemini setupComplete");
             ESP_LOGI("WEBSOCKET", "Gemini setupComplete - audio uplink READY");
+            display_set_system_state(FACE_LISTENING, "Mendengarkan...");
             if (!send_greeting()) ESP_LOGW(TAG, "WS_GEMINI: Greeting JSON gagal dikirim");
         }
         break;
     case GEMINI_MESSAGE_SERVER_CONTENT:
+        /* After the greeting turn, the next server-content event is the real
+         * Gemini response path. Mark THINKING from the actual server event;
+         * playback switches the face to SPEAKING when PCM reaches the speaker. */
+        if (s_greeting_finished) {
+            display_set_system_state(FACE_THINKING, "Berpikir...");
+        }
         handled = gemini_audio_process_server_root(root, generation);
         break;
     case GEMINI_MESSAGE_SESSION_RESUMPTION: {
@@ -216,6 +224,7 @@ bool gemini_protocol_process_message(const char *json, size_t len, uint32_t gene
         parse_goaway(root); ESP_LOGW(TAG, "Gemini GoAway timeLeft=%llums", (unsigned long long)s_goaway_ms); break;
     case GEMINI_MESSAGE_ERROR:
         ESP_LOGE(TAG, "GEMINI_PROTO: SERVER ERROR RAW: %.*s", (int)(len < 512U ? len : 512U), json);
+        display_set_system_state(FACE_ERROR, "Gemini error");
         audio_engine_notify(AUDIO_ENGINE_EVENT_ERROR, generation); handled = false; break;
     default:
         ESP_LOGW(TAG, "GEMINI_PROTO: message type unknown len=%u", (unsigned)len); handled = false; break;

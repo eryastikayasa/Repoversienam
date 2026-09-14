@@ -186,3 +186,21 @@ void display_engine_stop(void)
 {
     s_running = false;
 }
+
+void display_set_system_state(face_state_t face, const char *status)
+{
+    const char *text = status ? status : "";
+    display_face_set_state(face);
+    display_text_set_status(text);
+
+    /* Repo6's renderer selects user/gemini layers for listening/speaking.
+     * Mirror the system status into the active layer so the requested
+     * Repo5-style status is actually visible without adding a render task. */
+    display_text_set_user("");
+    display_text_set_gemini("");
+    if (face == FACE_LISTENING) {
+        display_text_set_user(text);
+    } else if (face == FACE_SPEAKING) {
+        display_text_set_gemini(text);
+    }
+}
