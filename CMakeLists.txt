@@ -1,14 +1,22 @@
 cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(Repoversienam)
 
 # Repo6 uses esp_websocket_client v1.7.0. Its send path treats a transport
 # write timeout (return 0, no errno) as a fatal transport error and aborts the
 # WebSocket. That makes a bounded 20 ms MIC send budget self-defeating.
-# Patch only that exact upstream condition at configure time so a finite MIC
-# send timeout returns 0 to Repo6 without aborting the connection. Real
-# transport errors (negative return) remain fatal.
+# PlatformIO/ESP-IDF materializes managed components under the build tree,
+# so this patch must run AFTER project() has resolved the component sources.
+# Patch only that exact upstream condition. Real negative transport errors
+# remain fatal.
 file(GLOB_RECURSE REPO6_WS_CLIENT_SOURCES
-     "${CMAKE_SOURCE_DIR}/managed_components/*/esp_websocket_client.c")
+     "${CMAKE_BINARY_DIR}/managed_components/*/esp_websocket_client.c")
+
+if(NOT REPO6_WS_CLIENT_SOURCES)
+    message(FATAL_ERROR "Repo6: esp_websocket_client.c not found under ${CMAKE_BINARY_DIR}/managed_components")
+endif()
+
+set(REPO6_WS_PATCHED_COUNT 0)
 foreach(REPO6_WS_CLIENT_SOURCE IN LISTS REPO6_WS_CLIENT_SOURCES)
     file(READ "${REPO6_WS_CLIENT_SOURCE}" REPO6_WS_CLIENT_TEXT)
     string(FIND "${REPO6_WS_CLIENT_TEXT}" "if (wlen == 0 && need_write != 0 && timeout != portMAX_DELAY)" REPO6_WS_ALREADY_PATCHED)
@@ -21,10 +29,15 @@ foreach(REPO6_WS_CLIENT_SOURCE IN LISTS REPO6_WS_CLIENT_SOURCES)
         endif()
         string(REPLACE "${REPO6_WS_OLD}" "${REPO6_WS_NEW}" REPO6_WS_CLIENT_TEXT "${REPO6_WS_CLIENT_TEXT}")
         file(WRITE "${REPO6_WS_CLIENT_SOURCE}" "${REPO6_WS_CLIENT_TEXT}")
+        math(EXPR REPO6_WS_PATCHED_COUNT "${REPO6_WS_PATCHED_COUNT} + 1")
         message(STATUS "Repo6: patched esp_websocket_client finite send timeout: ${REPO6_WS_CLIENT_SOURCE}")
     else()
         message(STATUS "Repo6: esp_websocket_client timeout patch already present: ${REPO6_WS_CLIENT_SOURCE}")
     endif()
 endforeach()
 
-project(Repoversienam)
+if(REPO6_WS_PATCHED_COUNT GREATER 0)
+    message(STATUS "Repo6: websocket timeout semantic patch applied to ${REPO6_WS_PATCHED_COUNT} source file(s)")
+else()
+    message(STATUS "Repo6: websocket timeout semantic patch already present")
+endif()
