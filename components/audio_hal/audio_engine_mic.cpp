@@ -52,6 +52,54 @@ static StaticSemaphore_t s_capture_stopped_storage;
 static SemaphoreHandle_t s_capture_stopped = nullptr;
 static uint32_t s_tx_queue_drops = 0;
 
+/* MIC transport profiling. This only measures the existing producer/consumer
+ * path; it does not alter queue depth, priority, core affinity, or ownership. */
+static uint64_t s_mic_profile_last_us = 0;
+static uint32_t s_mic_profile_count = 0;
+static uint64_t s_mic_profile_queue_wait_us = 0;
+static uint64_t s_mic_profile_queue_wait_max_us = 0;
+static uint64_t s_mic_profile_process_us = 0;
+static uint64_t s_mic_profile_process_max_us = 0;
+static uint32_t s_mic_profile_drops = 0;
+static uint32_t s_mic_profile_queue_high = 0;
+
+static void mic_profile_record(uint32_t queue_wait_us, uint32_t process_us)
+{
+    const uint64_t now_us = (uint64_t)esp_timer_get_time();
+    ++s_mic_profile_count;
+    s_mic_profile_queue_wait_us += queue_wait_us;
+    s_mic_profile_process_us += process_us;
+    if (queue_wait_us > s_mic_profile_queue_wait_max_us) s_mic_profile_queue_wait_max_us = queue_wait_us;
+    if (process_us > s_mic_profile_process_max_us) s_mic_profile_process_max_us = process_us;
+    if (s_tx_queue) {
+        const UBaseType_t depth = uxQueueMessagesWaiting(s_tx_queue);
+        if ((uint32_t)depth > s_mic_profile_queue_high) s_mic_profile_queue_high = (uint32_t)depth;
+    }
+    if (s_tx_queue_drops > s_mic_profile_drops) s_mic_profile_drops = s_tx_queue_drops;
+    if (!s_mic_profile_last_us) s_mic_profile_last_us = now_us;
+
+    if (now_us - s_mic_profile_last_us >= 5000000ULL) {
+        const uint32_t count = s_mic_profile_count ? s_mic_profile_count : 1U;
+        ESP_LOGI(TAG,
+                 "MIC_TX_QUEUE_PROFILE: count=%u queue_wait_avg_us=%llu queue_wait_max_us=%llu process_avg_us=%llu process_max_us=%llu queue_high=%u drops=%u",
+                 (unsigned)count,
+                 (unsigned long long)(s_mic_profile_queue_wait_us / count),
+                 (unsigned long long)s_mic_profile_queue_wait_max_us,
+                 (unsigned long long)(s_mic_profile_process_us / count),
+                 (unsigned long long)s_mic_profile_process_max_us,
+                 (unsigned)s_mic_profile_queue_high,
+                 (unsigned)s_mic_profile_drops);
+        s_mic_profile_last_us = now_us;
+        s_mic_profile_count = 0;
+        s_mic_profile_queue_wait_us = 0;
+        s_mic_profile_queue_wait_max_us = 0;
+        s_mic_profile_process_us = 0;
+        s_mic_profile_process_max_us = 0;
+        s_mic_profile_drops = 0;
+        s_mic_profile_queue_high = 0;
+    }
+}
+
 static const char *owner_name(mic_owner_t owner)
 {
     switch (owner) {
@@ -112,12 +160,18 @@ static void sink_task(void *arg)
     ESP_LOGI(TAG, "Mic transport worker aktif; queue=%ums, frame=%uB",
              (unsigned)(MIC_TX_QUEUE_DEPTH * 20U), (unsigned)MIC_FRAME_BYTES);
     for (;;) {
+        const int64_t queue_wait_start_us = esp_timer_get_time();
         if (xQueueReceive(s_tx_queue, frame, portMAX_DELAY) != pdTRUE) continue;
+        const uint32_t queue_wait_us = (uint32_t)(esp_timer_get_time() - queue_wait_start_us);
+        const int64_t process_start_us = esp_timer_get_time();
         if (!s_input_session_active || s_mic_owner != MIC_OWNER_GEMINI) continue;
 
         audio_engine_mic_sink_cb_t sink = s_mic_sink;
         void *sink_ctx = s_mic_sink_ctx;
         if (sink) sink(frame, MIC_FRAME_BYTES, sink_ctx);
+
+        const uint32_t process_us = (uint32_t)(esp_timer_get_time() - process_start_us);
+        mic_profile_record(queue_wait_us, process_us);
     }
 }
 
