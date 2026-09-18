@@ -13,9 +13,7 @@
 
 /* Repo5 websocket code uses legacy display helper names. Keep the
  * Repo6 display implementation untouched and adapt only at this boundary. */
-static inline void face_set_state(face_state_t state) { display_face_set_state(state); }
 static inline void face_show_for_ms(face_state_t state, uint32_t duration_ms) { display_face_show_for_ms(state, duration_ms); }
-static inline void display_status(const char *text) { display_text_set_status(text ? text : ""); }
 #define SESSION_HANDLE_MAX_LEN 1024
 #define WS_RX_MAX_PAYLOAD_SIZE (48 * 1024)
 #define WS_RX_SLOT_SIZE (40 * 1024)
