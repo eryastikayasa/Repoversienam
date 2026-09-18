@@ -1,4 +1,6 @@
-#include "display.h"
+#include "display_engine.h"
+#include "display_face.h"
+#include "display_text.h"
 #include "wifi_manager.h"
 #include "websocket_mgr.h"
 #include "audio_hal.h"
@@ -32,6 +34,27 @@
 
 static const char *TAG = "MAIN";
 #define BOOT_BUTTON_GPIO GPIO_NUM_0
+static void oled_init(void)
+{
+    display_engine_init();
+    display_engine_start();
+}
+
+static void face_animation_start(void)
+{
+    display_engine_start();
+}
+
+static void face_set_state(face_state_t state)
+{
+    display_face_set_state(state);
+}
+
+static void display_status(const char *text)
+{
+    display_text_set_status(text ? text : "");
+}
+
 
 static bool resolve_host(const char *label, const char *host, const char *port, char *resolved_ip, size_t resolved_ip_len)
 {
