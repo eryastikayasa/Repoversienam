@@ -309,10 +309,10 @@ static void audio_task(void *arg)
                     }
 
                     while (afe_staging_samples >= feed_samples) {
-                        size_t afe_samples = 0;
+                        size_t ignored_output_samples = 0;
                         if (!afe_audio_process(afe_input_staging, feed_samples,
                                                afe_pcm, sizeof(afe_pcm) / sizeof(afe_pcm[0]),
-                                               &afe_samples)) {
+                                               &ignored_output_samples)) {
                             ESP_LOGW(TAG, "AFE process gagal untuk feed=%u",
                                      (unsigned)feed_samples);
                             break;
@@ -321,22 +321,36 @@ static void audio_task(void *arg)
                         ++afe_input_frames;
                         afe_input_samples += feed_samples;
 
-                        if (afe_samples > 0) {
+                        /*
+                         * AFE feed/fetch are asynchronous. Drain every processed
+                         * frame currently available instead of consuming only one
+                         * result per feed. The external Gemini contract stays
+                         * identical to the pre-AFE path: accumulate PCM16 until
+                         * 3200 bytes, then call websocket_send_audio_data().
+                         */
+                        for (;;) {
+                            size_t afe_samples = 0;
+                            if (!afe_audio_fetch_output(afe_pcm,
+                                                        sizeof(afe_pcm) / sizeof(afe_pcm[0]),
+                                                        &afe_samples)) {
+                                ESP_LOGW(TAG, "AFE output fetch gagal");
+                                break;
+                            }
+                            if (afe_samples == 0) break;
+
                             const size_t afe_bytes = afe_samples * sizeof(int16_t);
                             ++afe_output_frames;
                             afe_output_samples += afe_samples;
                             afe_output_bytes += afe_bytes;
 
-                            if (buffer_pos + afe_bytes <= sizeof(audio_buffer)) {
-                                memcpy(audio_buffer + buffer_pos, afe_pcm, afe_bytes);
-                                buffer_pos += afe_bytes;
-                            } else {
-                                ESP_LOGW(TAG, "AFE output buffer full; dropping oldest Gemini frame");
-                                const size_t keep = sizeof(audio_buffer) - afe_bytes;
-                                if (keep > 0) memmove(audio_buffer, audio_buffer + buffer_pos - keep, keep);
-                                memcpy(audio_buffer + keep, afe_pcm, afe_bytes);
-                                buffer_pos = keep + afe_bytes;
+                            if (buffer_pos + afe_bytes > sizeof(audio_buffer)) {
+                                ESP_LOGE(TAG, "AFE output buffer overflow: pending=%u incoming=%u",
+                                         (unsigned)buffer_pos, (unsigned)afe_bytes);
+                                break;
                             }
+
+                            memcpy(audio_buffer + buffer_pos, afe_pcm, afe_bytes);
+                            buffer_pos += afe_bytes;
                         }
 
                         const size_t remainder = afe_staging_samples - feed_samples;
