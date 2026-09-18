@@ -256,9 +256,11 @@ static void audio_task(void *arg)
 {
     (void)arg;
     static int16_t raw_pcm[512];
+    static int16_t afe_input_staging[1024];
     static int16_t afe_pcm[512];
     static uint8_t audio_buffer[16384];
     size_t buffer_pos = 0;
+    size_t afe_staging_samples = 0;
     int64_t last_afe_log_us = 0;
     uint32_t afe_input_frames = 0;
     uint32_t afe_output_frames = 0;
@@ -283,36 +285,69 @@ static void audio_task(void *arg)
         if (bytes_read > 0) {
             const size_t samples_read = bytes_read / sizeof(int16_t);
 
-            /* Keep the existing raw MIC activity check only for the 60 s
-             * idle timer. It is NOT an audio TX gate anymore. */
+            /* Audio HAL already supplies PCM16/16 kHz/mono. AFE's feed
+             * chunk is 160 samples, while HAL reads up to 512 samples.
+             * Stage the existing PCM and feed exact AFE chunks without
+             * changing the audio format or Audio HAL. */
             if (mic_frame_has_activity(reinterpret_cast<const uint8_t *>(raw_pcm), bytes_read)) {
                 last_user_activity_us = esp_timer_get_time();
             }
 
-            size_t afe_samples = 0;
-            if (afe_audio_is_ready() &&
-                samples_read == (size_t)afe_audio_get_feed_samples() &&
-                afe_audio_process(raw_pcm, samples_read,
-                                  afe_pcm, sizeof(afe_pcm) / sizeof(afe_pcm[0]),
-                                  &afe_samples) &&
-                afe_samples > 0) {
-                const size_t afe_bytes = afe_samples * sizeof(int16_t);
-                ++afe_input_frames;
-                ++afe_output_frames;
-                afe_input_samples += samples_read;
-                afe_output_samples += afe_samples;
-                afe_output_bytes += afe_bytes;
-                if (buffer_pos + afe_bytes <= sizeof(audio_buffer)) {
-                    memcpy(audio_buffer + buffer_pos, afe_pcm, afe_bytes);
-                    buffer_pos += afe_bytes;
-                } else {
-                    ESP_LOGW(TAG, "AFE output buffer full; dropping oldest Gemini frame");
-                    const size_t keep = sizeof(audio_buffer) - afe_bytes;
-                    if (keep > 0) memmove(audio_buffer, audio_buffer + buffer_pos - keep, keep);
-                    memcpy(audio_buffer + keep, afe_pcm, afe_bytes);
-                    buffer_pos = keep + afe_bytes;
+            if (afe_audio_is_ready()) {
+                const size_t feed_samples = (size_t)afe_audio_get_feed_samples();
+
+                if (feed_samples > 0 && feed_samples <= sizeof(afe_input_staging) / sizeof(afe_input_staging[0])) {
+                    if (afe_staging_samples + samples_read <= sizeof(afe_input_staging) / sizeof(afe_input_staging[0])) {
+                        memcpy(afe_input_staging + afe_staging_samples,
+                               raw_pcm,
+                               samples_read * sizeof(int16_t));
+                        afe_staging_samples += samples_read;
+                    } else {
+                        ESP_LOGW(TAG, "AFE staging overflow; resetting pending PCM");
+                        afe_staging_samples = 0;
+                    }
+
+                    while (afe_staging_samples >= feed_samples) {
+                        size_t afe_samples = 0;
+                        if (!afe_audio_process(afe_input_staging, feed_samples,
+                                               afe_pcm, sizeof(afe_pcm) / sizeof(afe_pcm[0]),
+                                               &afe_samples)) {
+                            ESP_LOGW(TAG, "AFE process gagal untuk feed=%u",
+                                     (unsigned)feed_samples);
+                            break;
+                        }
+
+                        ++afe_input_frames;
+                        afe_input_samples += feed_samples;
+
+                        if (afe_samples > 0) {
+                            const size_t afe_bytes = afe_samples * sizeof(int16_t);
+                            ++afe_output_frames;
+                            afe_output_samples += afe_samples;
+                            afe_output_bytes += afe_bytes;
+
+                            if (buffer_pos + afe_bytes <= sizeof(audio_buffer)) {
+                                memcpy(audio_buffer + buffer_pos, afe_pcm, afe_bytes);
+                                buffer_pos += afe_bytes;
+                            } else {
+                                ESP_LOGW(TAG, "AFE output buffer full; dropping oldest Gemini frame");
+                                const size_t keep = sizeof(audio_buffer) - afe_bytes;
+                                if (keep > 0) memmove(audio_buffer, audio_buffer + buffer_pos - keep, keep);
+                                memcpy(audio_buffer + keep, afe_pcm, afe_bytes);
+                                buffer_pos = keep + afe_bytes;
+                            }
+                        }
+
+                        const size_t remainder = afe_staging_samples - feed_samples;
+                        if (remainder > 0) {
+                            memmove(afe_input_staging,
+                                    afe_input_staging + feed_samples,
+                                    remainder * sizeof(int16_t));
+                        }
+                        afe_staging_samples = remainder;
+                    }
                 }
-            } else if (!afe_audio_is_ready()) {
+            } else {
                 int64_t now_log = esp_timer_get_time();
                 if (last_afe_log_us == 0 || now_log - last_afe_log_us >= 2000000) {
                     last_afe_log_us = now_log;
