@@ -91,7 +91,7 @@ esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_re
         raw,
         samples * sizeof(int32_t),
         &bytes_read,
-        portMAX_DELAY);
+        50);
     if (err != ESP_OK) return err;
 
     const size_t count = bytes_read / sizeof(int32_t);
@@ -109,7 +109,7 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     static int32_t raw[512];
     size_t max_samples = max_len / sizeof(int16_t); if (max_samples > 512) max_samples = 512;
     size_t bytes_read = 0;
-    if (i2s_channel_read(rx_handle, raw, max_samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) return 0;
+    if (i2s_channel_read(rx_handle, raw, max_samples * sizeof(int32_t), &bytes_read, 50) != ESP_OK) return 0;
     size_t samples = bytes_read / sizeof(int32_t); int16_t *pcm = reinterpret_cast<int16_t *>(dest);
     for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
     return samples * sizeof(int16_t);
