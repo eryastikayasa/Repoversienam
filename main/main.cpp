@@ -260,6 +260,13 @@ static void audio_task(void *arg)
     static uint8_t audio_buffer[16384];
     size_t buffer_pos = 0;
     int64_t last_afe_log_us = 0;
+    uint32_t afe_input_frames = 0;
+    uint32_t afe_output_frames = 0;
+    uint64_t afe_input_samples = 0;
+    uint64_t afe_output_samples = 0;
+    uint64_t afe_output_bytes = 0;
+    uint32_t afe_tx_frames = 0;
+    int64_t last_afe_flow_log_us = 0;
 
     while (1) {
         if (!assistant_active) {
@@ -290,6 +297,11 @@ static void audio_task(void *arg)
                                   &afe_samples) &&
                 afe_samples > 0) {
                 const size_t afe_bytes = afe_samples * sizeof(int16_t);
+                ++afe_input_frames;
+                ++afe_output_frames;
+                afe_input_samples += samples_read;
+                afe_output_samples += afe_samples;
+                afe_output_bytes += afe_bytes;
                 if (buffer_pos + afe_bytes <= sizeof(audio_buffer)) {
                     memcpy(audio_buffer + buffer_pos, afe_pcm, afe_bytes);
                     buffer_pos += afe_bytes;
@@ -346,11 +358,29 @@ static void audio_task(void *arg)
              */
             if (!audio_turn_active) {
                 websocket_send_audio_data(audio_buffer, 3200);
+                ++afe_tx_frames;
+            } else {
+                ESP_LOGD(TAG, "AFE FLOW: TX ditahan karena Gemini sedang playback (turn aktif)");
             }
 
             const size_t remainder = buffer_pos - 3200;
             if (remainder > 0) memmove(audio_buffer, audio_buffer + 3200, remainder);
             buffer_pos = remainder;
+        }
+
+        const int64_t flow_now_us = esp_timer_get_time();
+        if (last_afe_flow_log_us == 0 || flow_now_us - last_afe_flow_log_us >= 2000000) {
+            last_afe_flow_log_us = flow_now_us;
+            ESP_LOGI(TAG,
+                     "AFE FLOW: input_frames=%u input_samples=%llu output_frames=%u output_samples=%llu output_bytes=%llu tx_100ms_frames=%u buffer=%u turn_active=%d",
+                     (unsigned)afe_input_frames,
+                     (unsigned long long)afe_input_samples,
+                     (unsigned)afe_output_frames,
+                     (unsigned long long)afe_output_samples,
+                     (unsigned long long)afe_output_bytes,
+                     (unsigned)afe_tx_frames,
+                     (unsigned)buffer_pos,
+                     audio_turn_active ? 1 : 0);
         }
 
         vTaskDelay(pdMS_TO_TICKS(1));
