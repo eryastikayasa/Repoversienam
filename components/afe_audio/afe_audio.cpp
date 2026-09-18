@@ -87,16 +87,19 @@ static void afe_fetch_worker(void *arg)
          * Queue copies the PCM, so the AFE result buffer remains owned by
          * ESP-SR and is never referenced after this iteration.
          */
-        if (xQueueSend(s_output_queue, result->data, 0) != pdTRUE) {
+        int16_t frame[512] = {};
+        if (samples > sizeof(frame) / sizeof(frame[0])) continue;
+        memcpy(frame, result->data, samples * sizeof(int16_t));
+
+        if (xQueueSend(s_output_queue, frame, 0) != pdTRUE) {
             /*
              * Output must never block the MIC/feed side. If Gemini is
              * temporarily slower, discard the oldest processed frame and
              * keep the newest one.
              */
-            int16_t *slot = nullptr;
-            if (xQueueReceive(s_output_queue, slot, 0) == pdTRUE) {
-                /* This receive form is not valid for a copied queue item. */
-            }
+            int16_t stale[512] = {};
+            (void)xQueueReceive(s_output_queue, stale, 0);
+            (void)xQueueSend(s_output_queue, frame, 0);
         }
     }
 
