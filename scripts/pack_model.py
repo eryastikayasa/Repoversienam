@@ -4,6 +4,14 @@ import argparse
 
 
 def struct_pack_string(string, max_len=None):
+    """
+    pack string to binary data.
+    if max_len is None, max_len = len(string) + 1
+    else len(string) < max_len, the left will be padded by struct.pack('x')
+
+    string: input python string
+    max_len: output
+    """
     if max_len is None:
         max_len = len(string)
     else:
@@ -22,11 +30,18 @@ def struct_pack_string(string, max_len=None):
 
 
 def read_data(filename):
+    """Read binary data, like index and model data."""
     with open(filename, "rb") as f:
         return f.read()
 
 
 def pack_models(model_path, out_file="srmodels.bin"):
+    """
+    Pack all models into one binary file using the ESP-SR model format.
+
+    The file order is deterministic and matches the known-good ESP-SR
+    model image layout: wn9_index, _MODEL_INFO_, then wn9_data.
+    """
     models = {}
     file_num = 0
 
@@ -40,6 +55,8 @@ def pack_models(model_path, out_file="srmodels.bin"):
                     file_path = os.path.join(model_dir, file_name)
                     models[model_name][file_name] = read_data(file_path)
 
+    # Keep the single-model ESP-SR package layout identical to the
+    # known-good baseline artifact: index -> model info -> data.
     preferred_order = {
         "wn9_index": 0,
         "_MODEL_INFO_": 1,
