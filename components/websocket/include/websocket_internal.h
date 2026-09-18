@@ -41,6 +41,9 @@ extern uint32_t audio_chunks_received; extern uint64_t audio_bytes_received; ext
 void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data); void reset_rx_buffer(void); bool ensure_rx_buffer(size_t required_size); void process_websocket_payload(esp_websocket_event_data_t *data); void process_gemini_message(const char *json, size_t len); bool build_gemini_setup(char **output, size_t *output_len); void clear_session_handle(void); bool store_session_handle(const char *handle); size_t get_audio_pending_bytes(void); bool start_audio_playback(void); void clear_audio_buffer(void); void request_audio_buffer_clear(void); void reset_audio_turn_stats(void); void begin_audio_turn(void); bool queue_audio_pcm(const uint8_t *pcm, size_t len); void check_audio_playback_complete(void);
 void websocket_disconnect(void);
 void websocket_reset_started(void);
+void websocket_request_standby(void);
+bool websocket_standby_requested(void);
+void websocket_clear_standby_request(void);
 bool websocket_cleanup_is_pending(void);
 void websocket_cleanup_complete(void);
 bool websocket_send_tool_response(const char *id, const char *name, bool success);
