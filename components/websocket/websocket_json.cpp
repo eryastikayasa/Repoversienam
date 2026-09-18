@@ -1,6 +1,5 @@
 #include "websocket_internal.h"
 #include "web_config.h"
-#include "display.h"
 #include "audio_hal.h"
 #include "uart_control.h"
 
