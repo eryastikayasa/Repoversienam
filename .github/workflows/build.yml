@@ -13,7 +13,7 @@ on:
 jobs:
   build:
     name: Build ESP32-S3 Firmware
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,21 +55,16 @@ jobs:
           git init
           git remote add origin https://github.com/espressif/esp-sr.git
           git config core.sparseCheckout true
-          git sparse-checkout set model/wakenet_model/wn9_hiesp model/nsnet_model/nsnet2
+          git sparse-checkout set model/wakenet_model/wn9_hiesp
           git fetch --depth 1 origin "$ESP_SR_COMMIT"
           git checkout --detach FETCH_HEAD
           MODEL_SRC="$SRC_DIR/model/wakenet_model/wn9_hiesp"
-          NS_MODEL_SRC="$SRC_DIR/model/nsnet_model/nsnet2"
           test -d "$MODEL_SRC"
           test -s "$MODEL_SRC/wn9_index"
           test -s "$MODEL_SRC/wn9_data"
-          test -d "$NS_MODEL_SRC"
-          test -n "$(find "$NS_MODEL_SRC" -type f -print -quit)"
           echo "ESP-SR v2.4.5 commit: $ESP_SR_COMMIT"
-          echo "WakeNet model source: $MODEL_SRC"
-          echo "NSNet2 model source: $NS_MODEL_SRC"
+          echo "Model source: $MODEL_SRC"
           ls -lah "$MODEL_SRC"
-          ls -lah "$NS_MODEL_SRC"
 
       - name: Generate ESP-SR srmodels.bin with repository pack_model.py
         env:
@@ -84,30 +79,24 @@ jobs:
           PACKER="$PWD/scripts/pack_model.py"
           test -f "$PACKER"
           MODEL_SRC="$RUNNER_TEMP/esp-sr-v2.4.5/model/wakenet_model/wn9_hiesp"
-          NS_MODEL_SRC="$RUNNER_TEMP/esp-sr-v2.4.5/model/nsnet_model/nsnet2"
           test -d "$MODEL_SRC"
           test -s "$MODEL_SRC/wn9_index"
           test -s "$MODEL_SRC/wn9_data"
-          test -d "$NS_MODEL_SRC"
           echo "=== ESP-SR MODEL DIAGNOSTIC ==="
           echo "Final sdkconfig: $SDKCONFIG"
           echo "Repository packer: $PACKER"
           echo "Python: $(python --version)"
-          echo "ESP-SR v2.4.5 WakeNet source: $MODEL_SRC"
-          echo "ESP-SR v2.4.5 NSNet2 source: $NS_MODEL_SRC"
+          echo "ESP-SR v2.4.5 model source: $MODEL_SRC"
           grep -E '^CONFIG_IDF_TARGET=' "$SDKCONFIG" || true
           grep -E '^CONFIG_SR_WN_WN9_HIESP=y$' "$SDKCONFIG"
-          grep -E '^CONFIG_SR_NSN_NSNET2=y$' "$SDKCONFIG"
           echo "--- source model files ---"
           ls -lah "$MODEL_SRC"
-          ls -lah "$NS_MODEL_SRC"
           echo "--- packer syntax check ---"
           python -m py_compile "$PACKER"
           mkdir -p "$BUILD/srmodels"
           rm -f "$BUILD/srmodels/srmodels.bin"
-          rm -rf "$BUILD/srmodels/wn9_hiesp" "$BUILD/srmodels/nsnet2"
+          rm -rf "$BUILD/srmodels/wn9_hiesp"
           cp -a "$MODEL_SRC" "$BUILD/srmodels/wn9_hiesp"
-          cp -a "$NS_MODEL_SRC" "$BUILD/srmodels/nsnet2"
           MODEL="$BUILD/srmodels/srmodels.bin"
           echo "=== RUN ESP-SR pack_model.py ==="
           python -u "$PACKER" -m "$BUILD/srmodels" -o "$MODEL"
@@ -116,19 +105,15 @@ jobs:
           test -s "$MODEL"
           test -s "$BUILD/srmodels/wn9_hiesp/wn9_index"
           test -s "$BUILD/srmodels/wn9_hiesp/wn9_data"
-          test -d "$BUILD/srmodels/nsnet2"
-          test -n "$(find "$BUILD/srmodels/nsnet2" -type f -print -quit)"
           MODEL_SIZE=$(stat -c %s "$BUILD/srmodels/srmodels.bin")
           test "$MODEL_SIZE" -le $((0x400000))
           grep -a -q "wn9_hiesp" "$MODEL"
-          grep -a -q "nsnet2" "$MODEL"
           echo "ESP-SR model image: $MODEL"
           echo "ESP-SR model size: $MODEL_SIZE bytes"
           echo "ESP-SR pack_model.py: PASS"
           echo "WakeNet9 Hi ESP model files: PASS"
-          echo "NSNet2 model files: PASS"
 
-      - name: Audit final sdkconfig, 16MB flash and ESP-SR models
+      - name: Audit final sdkconfig, 16MB flash and WakeNet9
         run: |
           set -euo pipefail
           BUILD=.pio/build/esp32-s3-devkitc-1
@@ -142,7 +127,6 @@ jobs:
           grep -E '^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/partitions.csv\"$' "$SDKCONFIG"
           grep -E '^model,.*0x400000' partitions/partitions.csv
           grep -E '^CONFIG_SR_WN_WN9_HIESP=y$' "$SDKCONFIG"
-          grep -E '^CONFIG_SR_NSN_NSNET2=y$' "$SDKCONFIG"
           test -f "$BUILD/firmware.bin"
           test -f "$BUILD/bootloader.bin"
           test -f "$BUILD/partitions.bin"
@@ -150,19 +134,14 @@ jobs:
           test -s "$BUILD/srmodels/srmodels.bin"
           test -s "$BUILD/srmodels/wn9_hiesp/wn9_index"
           test -s "$BUILD/srmodels/wn9_hiesp/wn9_data"
-          test -d "$BUILD/srmodels/nsnet2"
-          test -n "$(find "$BUILD/srmodels/nsnet2" -type f -print -quit)"
           grep -a -q "wn9_hiesp" "$BUILD/srmodels/srmodels.bin"
-          grep -a -q "nsnet2" "$BUILD/srmodels/srmodels.bin"
           MODEL_SIZE=$(stat -c %s "$BUILD/srmodels/srmodels.bin")
           test "$MODEL_SIZE" -le $((0x400000))
           echo "Flash size: 16MB PASS"
           echo "Custom partition table: PASS"
           echo "WakeNet9 Hi ESP config: PASS"
-          echo "NSNet2 config: PASS"
           echo "ESP-SR model generation: PASS"
           echo "WakeNet9 model payload: PASS"
-          echo "NSNet2 model payload: PASS"
           echo "Model partition capacity (4MiB): PASS"
 
       - name: Audit final sdkconfig and CA bundle
@@ -192,13 +171,11 @@ jobs:
           test -s "$BUILD/srmodels/srmodels.bin"
           test -s "$BUILD/srmodels/wn9_hiesp/wn9_index"
           test -s "$BUILD/srmodels/wn9_hiesp/wn9_data"
-          test -d "$BUILD/srmodels/nsnet2"
-          test -n "$(find "$BUILD/srmodels/nsnet2" -type f -print -quit)"
           echo "========================================"
           echo "COMPATIBILITY GATE: PASS"
           echo "ESP32-S3 + 16MB Flash + 8MB OPI PSRAM"
           echo "ESP-IDF 6.0.1 + ESP-SR 2.4.5"
-          echo "WakeNet9 Hi ESP + NSNet2"
+          echo "WakeNet9 Hi ESP + ESP-SR model tools"
           echo "CA bundle + embedded TLS trust store"
           echo "Model partition: 4MiB"
           echo "========================================"
