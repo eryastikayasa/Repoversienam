@@ -233,7 +233,7 @@ void websocket_app_start(void)
     if (!start_audio_playback()) return;
     clear_audio_buffer(); reset_audio_turn_stats(); reset_rx_buffer(); websocket_tx_flush_queue();
     if (!websocket_tx_init() || !websocket_rx_init()) return;
-    is_connected = false; setup_complete = false; websocket_tx_error = false; ws_started = false;
+    is_connected = false; setup_complete = false; websocket_tx_error = false; ws_started = false; standby_requested = false;
     esp_websocket_client_config_t cfg = {};
     cfg.uri = WEBSOCKET_SERVER_URL;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -275,4 +275,20 @@ void websocket_disconnect(void)
 void websocket_reset_started(void)
 {
     ws_started = false;
+}
+
+void websocket_request_standby(void)
+{
+    standby_requested = true;
+    ESP_LOGI(TAG, "Standby Gemini diminta oleh tool");
+}
+
+bool websocket_standby_requested(void)
+{
+    return standby_requested;
+}
+
+void websocket_clear_standby_request(void)
+{
+    standby_requested = false;
 }
