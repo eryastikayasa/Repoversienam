@@ -1,37 +1,31 @@
 idf_component_register(
     SRCS
-        "websocket.cpp"
-        "websocket_transport.cpp"
-        "websocket_transport_profile.cpp"
-        "websocket_event.cpp"
+        "websocket_mgr.cpp"
+        "websocket_events.cpp"
+        "websocket_rx.cpp"
+        "websocket_json.cpp"
         "websocket_audio.cpp"
-        "gemini/gemini_protocol.cpp"
-        "gemini/gemini_message.cpp"
-        "gemini/gemini_audio.cpp"
-        "gemini/gemini_tool.cpp"
+        "websocket_tx.cpp"
+        "websocket_tool.cpp"
+        "websocket_stack_wrap.c"
+
     INCLUDE_DIRS
         "include"
-        "gemini"
+
     REQUIRES
         esp_websocket_client
         esp-tls
-        mbedtls
-        esp_timer
-        audio_hal
-        web_config
+        esp_event
         cjson
+        mbedtls
+        display
+        audio_hal
+        wifi_manager
         uart_control
+        web_config
 )
 
-# Diagnostic-only linker wrappers. They measure the actual synchronous
-# transport/TLS and audio-capture stages without changing queue depth,
-# existing mic_tx priority/core, or AudioEngine ownership.
-target_link_options(${COMPONENT_LIB} INTERFACE
-    "-Wl,--wrap=esp_transport_poll_write"
-    "-Wl,--wrap=esp_transport_write"
-    "-Wl,--wrap=esp_tls_conn_write"
-    "-Wl,--wrap=audio_read_mic"
-    "-Wl,--wrap=i2s_channel_read"
-    "-Wl,--wrap=aec_process"
-    "-Wl,--wrap=xQueueGenericSend"
+# V7.0.12: increase only the ESP WebSocket client's internal task stack.
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=esp_websocket_client_init"
 )
