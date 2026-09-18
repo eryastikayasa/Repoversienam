@@ -291,35 +291,35 @@ static void process_gemini_tool_call(cJSON *tool_call)
                 const char *cmd = command->valuestring;
 
                 if (strcmp(cmd, "face_idle") == 0) {
-                    face_show_for_ms(FACE_IDLE, 5000);
+                    display_face_show_for_ms(FACE_IDLE, 5000);
                     success = true;
                 }
                 else if (strcmp(cmd, "face_listening") == 0) {
-                    face_show_for_ms(FACE_LISTENING, 5000);
+                    display_face_show_for_ms(FACE_LISTENING, 5000);
                     success = true;
                 }
                 else if (strcmp(cmd, "face_thinking") == 0) {
-                    face_show_for_ms(FACE_THINKING, 5000);
+                    display_face_show_for_ms(FACE_THINKING, 5000);
                     success = true;
                 }
                 else if (strcmp(cmd, "face_speaking") == 0) {
-                    face_show_for_ms(FACE_SPEAKING, 5000);
+                    display_face_show_for_ms(FACE_SPEAKING, 5000);
                     success = true;
                 }
                 else if (strcmp(cmd, "face_happy") == 0) {
-                    face_show_for_ms(FACE_HAPPY, 5000);
+                    display_face_show_for_ms(FACE_HAPPY, 5000);
                     success = true;
                 }
                 else if (strcmp(cmd, "face_sad") == 0) {
-                    face_show_for_ms(FACE_SAD, 5000);
+                    display_face_show_for_ms(FACE_SAD, 5000);
                     success = true;
                 }
                 else if (strcmp(cmd, "face_error") == 0) {
-                    face_show_for_ms(FACE_ERROR, 5000);
+                    display_face_show_for_ms(FACE_ERROR, 5000);
                     success = true;
                 }
                 else if (strcmp(cmd, "face_sleep") == 0) {
-                    face_show_for_ms(FACE_SLEEP, 5000);
+                    display_face_show_for_ms(FACE_SLEEP, 5000);
                     success = true;
                 }
                 else {
@@ -348,7 +348,7 @@ void process_gemini_message(const char *json, size_t len)
     if (cJSON_IsObject(setup_complete_obj)) {
         setup_complete = true;
         ESP_LOGI(TAG, "Gemini setupComplete: SESI SIAP");
-        display_status("AI Siap!");
+        display_text_set_status("AI Siap!");
         cJSON_Delete(root);
         return;
     }
