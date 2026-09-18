@@ -8,6 +8,7 @@
 #include "uart_control.h"
 #include "web_config.h"
 #include "wakeword.h"
+#include "afe_audio.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -254,10 +255,11 @@ static void wait_for_gemini_mic_release(void)
 static void audio_task(void *arg)
 {
     (void)arg;
-    static uint8_t audio_buffer[4096];
+    static int16_t raw_pcm[512];
+    static int16_t afe_pcm[512];
+    static uint8_t audio_buffer[16384];
     size_t buffer_pos = 0;
-    uint32_t silent_frames = 0;
-    int64_t last_silent_log_us = 0;
+    int64_t last_afe_log_us = 0;
 
     while (1) {
         if (!assistant_active) {
@@ -267,10 +269,45 @@ static void audio_task(void *arg)
 
         audio_task_reading = true;
         size_t bytes_read = audio_read_mic(
-            audio_buffer + buffer_pos,
-            sizeof(audio_buffer) - buffer_pos);
+            reinterpret_cast<uint8_t *>(raw_pcm),
+            sizeof(raw_pcm));
         audio_task_reading = false;
-        if (bytes_read > 0) buffer_pos += bytes_read;
+
+        if (bytes_read > 0) {
+            const size_t samples_read = bytes_read / sizeof(int16_t);
+
+            /* Keep the existing raw MIC activity check only for the 60 s
+             * idle timer. It is NOT an audio TX gate anymore. */
+            if (mic_frame_has_activity(reinterpret_cast<const uint8_t *>(raw_pcm), bytes_read)) {
+                last_user_activity_us = esp_timer_get_time();
+            }
+
+            size_t afe_samples = 0;
+            if (afe_audio_is_ready() &&
+                samples_read == (size_t)afe_audio_get_feed_samples() &&
+                afe_audio_process(raw_pcm, samples_read,
+                                  afe_pcm, sizeof(afe_pcm) / sizeof(afe_pcm[0]),
+                                  &afe_samples) &&
+                afe_samples > 0) {
+                const size_t afe_bytes = afe_samples * sizeof(int16_t);
+                if (buffer_pos + afe_bytes <= sizeof(audio_buffer)) {
+                    memcpy(audio_buffer + buffer_pos, afe_pcm, afe_bytes);
+                    buffer_pos += afe_bytes;
+                } else {
+                    ESP_LOGW(TAG, "AFE output buffer full; dropping oldest Gemini frame");
+                    const size_t keep = sizeof(audio_buffer) - afe_bytes;
+                    if (keep > 0) memmove(audio_buffer, audio_buffer + buffer_pos - keep, keep);
+                    memcpy(audio_buffer + keep, afe_pcm, afe_bytes);
+                    buffer_pos = keep + afe_bytes;
+                }
+            } else if (!afe_audio_is_ready()) {
+                int64_t now_log = esp_timer_get_time();
+                if (last_afe_log_us == 0 || now_log - last_afe_log_us >= 2000000) {
+                    last_afe_log_us = now_log;
+                    ESP_LOGW(TAG, "AFE Gemini path not ready; raw audio is not sent");
+                }
+            }
+        }
 
         if (!websocket_is_connected()) {
             if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
@@ -281,15 +318,16 @@ static void audio_task(void *arg)
                 buffer_pos = 0;
                 continue;
             }
-            buffer_pos = 0;
-            vTaskDelay(pdMS_TO_TICKS(100));
+            /* Keep a bounded AFE pre-roll while the WebSocket is connecting.
+             * This prevents the first part of the user's sentence from being
+             * erased merely because TLS/WebSocket setup is still in progress. */
+            if (buffer_pos > sizeof(audio_buffer)) buffer_pos = sizeof(audio_buffer);
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
         if (buffer_pos >= 3200) {
-            bool has_activity = mic_frame_has_activity(audio_buffer, 3200);
-            if (has_activity) last_user_activity_us = esp_timer_get_time();
-            int64_t now_us = esp_timer_get_time();
+            const int64_t now_us = esp_timer_get_time();
 
             if (now_us - last_user_activity_us > 60 * 1000000LL) {
                 ESP_LOGI(TAG, "Idle 60 detik, menutup sesi.");
@@ -301,25 +339,21 @@ static void audio_task(void *arg)
                 continue;
             }
 
+            /*
+             * Do not perform amplitude-VAD gating here. Every processed AFE
+             * frame is valid Gemini input. Gemini Live Automatic Activity
+             * Detection remains responsible for speech turn boundaries.
+             */
             if (!audio_turn_active) {
-                if (has_activity) {
-                    websocket_send_audio_data(audio_buffer, 3200);
-                } else {
-                    silent_frames++;
-                    int64_t now_log = esp_timer_get_time();
-                    if (last_silent_log_us == 0 || now_log - last_silent_log_us >= 1000000) {
-                        last_silent_log_us = now_log;
-                        ESP_LOGI(TAG, "V7.0.36 MIC TX gate: silent frames dropped=%lu", (unsigned long)silent_frames);
-                    }
-                }
+                websocket_send_audio_data(audio_buffer, 3200);
             }
 
-            size_t remainder = buffer_pos - 3200;
+            const size_t remainder = buffer_pos - 3200;
             if (remainder > 0) memmove(audio_buffer, audio_buffer + 3200, remainder);
             buffer_pos = remainder;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -418,6 +452,11 @@ extern "C" void app_main()
                 wakeword_clear_detected();
                 wakeword_stop();
                 (void)audio_hal_stop_capture();
+                if (!afe_audio_init()) {
+                    ESP_LOGE(TAG, "AFE init gagal; Gemini session tidak dimulai");
+                    face_set_state(FACE_ERROR);
+                    continue;
+                }
                 assistant_active = true;
                 connect_start_us = esp_timer_get_time();
                 last_user_activity_us = connect_start_us;
@@ -434,6 +473,11 @@ extern "C" void app_main()
                     (void)audio_hal_stop_capture();
                     wakeword_clear_detected();
                     ESP_LOGI(TAG, "Tombol ditekan! Memulai sesi...");
+                    if (!afe_audio_init()) {
+                        ESP_LOGE(TAG, "AFE init gagal; Gemini session tidak dimulai");
+                        face_set_state(FACE_ERROR);
+                        continue;
+                    }
                     assistant_active = true;
                     connect_start_us = esp_timer_get_time();
                     last_user_activity_us = connect_start_us;
