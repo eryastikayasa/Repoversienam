@@ -240,6 +240,16 @@ static bool mic_frame_has_activity(const uint8_t *data, size_t len)
 static bool assistant_active = false;
 static int64_t last_user_activity_us = 0;
 static int64_t connect_start_us = 0;
+static volatile bool audio_task_reading = false;
+
+static void wait_for_gemini_mic_release(void)
+{
+    (void)audio_hal_stop_capture();
+    for (uint32_t i = 0; i < 100 && audio_task_reading; ++i)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    if (audio_task_reading)
+        ESP_LOGW(TAG, "MIC handoff: audio_task masih membaca setelah 100 ms");
+}
 
 static void audio_task(void *arg)
 {
@@ -255,15 +265,18 @@ static void audio_task(void *arg)
             continue;
         }
 
+        audio_task_reading = true;
         size_t bytes_read = audio_read_mic(
             audio_buffer + buffer_pos,
             sizeof(audio_buffer) - buffer_pos);
+        audio_task_reading = false;
         if (bytes_read > 0) buffer_pos += bytes_read;
 
         if (!websocket_is_connected()) {
             if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
                 ESP_LOGW(TAG, "Koneksi gagal. Kembali ke mode sleep.");
                 assistant_active = false;
+                (void)audio_hal_stop_capture();
                 face_set_state(FACE_SLEEP);
                 buffer_pos = 0;
                 continue;
@@ -281,6 +294,7 @@ static void audio_task(void *arg)
             if (now_us - last_user_activity_us > 60 * 1000000LL) {
                 ESP_LOGI(TAG, "Idle 60 detik, menutup sesi.");
                 assistant_active = false;
+                (void)audio_hal_stop_capture();
                 face_set_state(FACE_SLEEP);
                 websocket_disconnect();
                 buffer_pos = 0;
@@ -391,6 +405,7 @@ extern "C" void app_main()
             if (assistant_active) {
                 ESP_LOGI(TAG, "Standby Gemini: menutup sesi dan mengaktifkan Wake Word");
                 assistant_active = false;
+                wait_for_gemini_mic_release();
                 face_set_state(FACE_SLEEP);
                 websocket_disconnect();
                 last_user_activity_us = 0;
@@ -402,6 +417,7 @@ extern "C" void app_main()
             if (wakeword_detected()) {
                 wakeword_clear_detected();
                 wakeword_stop();
+                (void)audio_hal_stop_capture();
                 assistant_active = true;
                 connect_start_us = esp_timer_get_time();
                 last_user_activity_us = connect_start_us;
@@ -415,6 +431,7 @@ extern "C" void app_main()
                         vTaskDelay(pdMS_TO_TICKS(10));
                     }
                     wakeword_stop();
+                    (void)audio_hal_stop_capture();
                     wakeword_clear_detected();
                     ESP_LOGI(TAG, "Tombol ditekan! Memulai sesi...");
                     assistant_active = true;
