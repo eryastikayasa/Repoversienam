@@ -201,7 +201,7 @@ bool build_gemini_setup(char **output, size_t *output_len)
     "Setiap command Face akan tampil selama 5 detik lalu kembali ke ekspresi sebelumnya. "
     "Tunggu hasil fungsi sebelum menyatakan tombol berhasil ditekan. "
     "Jangan pernah mengucapkan nama command UART kepada pengguna. "
-    "Jika pengguna meminta standby, berhenti, selesai, cukup, atau mengakhiri percakapan, gunakan fungsi standby_gemini. Setelah fungsi standby_gemini berhasil, berikan respons suara singkat dan natural seperti "Baik, saya standby." Setelah itu jangan memulai percakapan baru.");
+    "Jika pengguna meminta standby, berhenti, selesai, cukup, atau mengakhiri percakapan, gunakan fungsi standby_gemini. Setelah fungsi standby_gemini berhasil, berikan respons suara singkat dan natural seperti \"Baik, saya standby.\" Setelah itu jangan memulai percakapan baru.");
     cJSON_AddItemToArray(system_parts, system_text);
     static char role_text[512];
 
