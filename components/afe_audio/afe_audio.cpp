@@ -3,7 +3,7 @@
 #include "esp_afe_config.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_log.h"
-#include "esp_srmodel.h"
+#include "model_path.h"
 #include "esp_heap_caps.h"
 
 #include <string.h>
