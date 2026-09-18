@@ -285,10 +285,11 @@ static void audio_task(void *arg)
         if (bytes_read > 0) {
             const size_t samples_read = bytes_read / sizeof(int16_t);
 
-            /* Audio HAL already supplies PCM16/16 kHz/mono. AFE's feed
-             * chunk is 160 samples, while HAL reads up to 512 samples.
-             * Stage the existing PCM and feed exact AFE chunks without
-             * changing the audio format or Audio HAL. */
+            /* Audio HAL already supplies PCM16/16 kHz/mono. AFE's feed chunk is
+             * determined at runtime by get_feed_chunksize(); HAL reads up to
+             * 512 samples and staging handles any remainder.
+             * Stage the existing PCM and feed exact runtime AFE chunks reported by
+             * get_feed_chunksize(), without changing the audio format or Audio HAL. */
             if (mic_frame_has_activity(reinterpret_cast<const uint8_t *>(raw_pcm), bytes_read)) {
                 last_user_activity_us = esp_timer_get_time();
             }
