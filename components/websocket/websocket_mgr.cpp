@@ -1,6 +1,5 @@
 #include "websocket_mgr.h"
 #include "websocket_internal.h"
-#include "display.h"
 #include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
