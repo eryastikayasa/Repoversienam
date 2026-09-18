@@ -22,6 +22,8 @@ bool afe_audio_process(const int16_t *input, size_t input_samples,
 /* Drain one already-processed AFE output frame without feeding new input. */
 bool afe_audio_fetch_output(int16_t *output, size_t output_capacity_samples,
                             size_t *output_samples);
+/* Discard all already-processed AFE output frames. */
+void afe_audio_flush_output(void);
 
 int afe_audio_get_feed_samples(void);
 int afe_audio_get_fetch_samples(void);
