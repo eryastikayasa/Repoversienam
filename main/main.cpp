@@ -515,12 +515,19 @@ extern "C" void app_main()
 
     while (1) {
         if (websocket_standby_requested()) {
-            websocket_clear_standby_request();
-            if (assistant_active) {
-                ESP_LOGI(TAG, "Standby Gemini: menutup sesi dan mengaktifkan Wake Word");
+            /*
+             * Gemini must get a chance to speak the short standby acknowledgement.
+             * If a model audio turn is active, wait until turnComplete + playback
+             * drain clears audio_turn_active. Do not tear down the Live session
+             * while the acknowledgement is still in the playback ring.
+             */
+            if (assistant_active && !audio_turn_active && !audio_turn_complete_pending) {
+                ESP_LOGI(TAG, "Standby Gemini: respons selesai, menutup sesi dan mengaktifkan Wake Word");
+                websocket_clear_standby_request();
                 assistant_active = false;
                 wait_for_gemini_mic_release();
                 face_set_state(FACE_SLEEP);
+                display_status("Katakan: Hi, ESP");
                 websocket_disconnect();
                 last_user_activity_us = 0;
                 connect_start_us = 0;
