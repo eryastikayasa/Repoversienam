@@ -381,6 +381,10 @@ void process_gemini_message(const char *json, size_t len)
         setup_complete = true;
         ESP_LOGI(TAG, "Gemini setupComplete: SESI SIAP");
         display_text_set_status("AI Siap!");
+        /* Conversation is now ready: leave the wakeword/button HAPPY pose
+         * and enter the normal listening state. The locked display renderer
+         * remains untouched. */
+        display_face_set_state(FACE_LISTENING);
         cJSON_Delete(root);
         return;
     }
@@ -414,6 +418,11 @@ void process_gemini_message(const char *json, size_t len)
 
         cJSON *turn = cJSON_GetObjectItem(server, "modelTurn");
         if (cJSON_IsObject(turn)) {
+            /* Gemini has started producing the response. Keep THINKING visible
+             * while model audio is being buffered; websocket_audio.cpp changes
+             * to SPEAKING only when PCM actually reaches the playback path. */
+            display_face_set_state(FACE_THINKING);
+
             cJSON *parts = cJSON_GetObjectItem(turn, "parts");
             if (cJSON_IsArray(parts)) {
                 cJSON *part = NULL;
