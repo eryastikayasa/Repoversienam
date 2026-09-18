@@ -198,7 +198,8 @@ bool build_gemini_setup(char **output, size_t *output_len)
     "dan face_idle untuk ekspresi netral. "
     "Setiap command Face akan tampil selama 5 detik lalu kembali ke ekspresi sebelumnya. "
     "Tunggu hasil fungsi sebelum menyatakan tombol berhasil ditekan. "
-    "Jangan pernah mengucapkan nama command UART kepada pengguna.");
+    "Jangan pernah mengucapkan nama command UART kepada pengguna. "
+    "Jika pengguna meminta standby, berhenti, selesai, cukup, atau mengakhiri percakapan (misalnya \\"Gemini standby\\", \\"Gemini standby dulu\\", \\"tolong berhenti dulu\\", \\"berhenti\\", \\"sudah selesai\\", \\"cukup dulu\\", atau \\"akhiri percakapan\\") gunakan fungsi standby_gemini. Setelah fungsi standby_gemini berhasil, jangan melanjutkan percakapan.");
     cJSON_AddItemToArray(system_parts, system_text);
     static char role_text[512];
 
@@ -211,6 +212,19 @@ if (web_config_load_role(role_text, sizeof(role_text)) &&
     }
 }
     add_device_control_tool(setup);
+
+    cJSON *standby_tool = cJSON_CreateObject();
+    if (standby_tool) {
+        cJSON *standby_functions = cJSON_AddArrayToObject(standby_tool, "functionDeclarations");
+        cJSON *standby_decl = cJSON_CreateObject();
+        cJSON_AddStringToObject(standby_decl, "name", "standby_gemini");
+        cJSON_AddStringToObject(standby_decl, "description",
+            "Mengakhiri sesi percakapan Gemini saat pengguna meminta standby, berhenti, selesai, cukup, atau mengakhiri percakapan. Gunakan fungsi ini segera dan jangan hanya mengatakan akan standby.");
+        cJSON *standby_params = cJSON_AddObjectToObject(standby_decl, "parameters");
+        cJSON_AddStringToObject(standby_params, "type", "OBJECT");
+        cJSON_AddItemToArray(standby_functions, standby_decl);
+        cJSON_AddItemToArray(cJSON_GetObjectItem(setup, "tools"), standby_tool);
+    }
 
     cJSON *realtime = cJSON_AddObjectToObject(setup, "realtimeInputConfig");
     cJSON *aad = cJSON_AddObjectToObject(realtime, "automaticActivityDetection");
@@ -284,6 +298,17 @@ static void process_gemini_tool_call(cJSON *tool_call)
         ESP_LOGI(TAG, "Gemini TOOL CALL: %s id=%s", name->valuestring, id->valuestring);
 
         bool success = false;
+        if (strcmp(name->valuestring, "standby_gemini") == 0) {
+            success = websocket_send_tool_response(id->valuestring, name->valuestring, true);
+            if (success) {
+                websocket_request_standby();
+                ESP_LOGI(TAG, "Gemini standby_gemini diterima: orderly shutdown diminta");
+            } else {
+                ESP_LOGW(TAG, "Gemini standby_gemini: toolResponse gagal dikirim");
+            }
+            continue;
+        }
+
         if (strcmp(name->valuestring, "control_device") == 0) {
             cJSON *command = cJSON_GetObjectItem(args, "command");
 
