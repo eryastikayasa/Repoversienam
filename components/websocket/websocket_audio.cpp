@@ -1,7 +1,6 @@
 #include "websocket_internal.h"
 #include "websocket_mgr.h"
 #include "audio_hal.h"
-#include "display.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
