@@ -148,7 +148,10 @@ extern "C" bool afe_audio_process(const int16_t *input, size_t input_samples,
         return false;
     }
 
-    if (s_handle->feed(s_data, input) != ESP_OK) {
+    /* ESP-SR AFE v2 feed() returns the number of bytes written to its
+     * input ring, not an esp_err_t. Do not compare it with ESP_OK. */
+    const int fed = s_handle->feed(s_data, input);
+    if (fed <= 0) {
         return false;
     }
 
