@@ -36,6 +36,11 @@ static TaskHandle_t s_fetch_task = nullptr;
 static volatile bool s_fetch_running = false;
 
 static constexpr size_t AFE_OUTPUT_QUEUE_DEPTH = 8;
+
+struct afe_output_frame_t {
+    int16_t pcm[512];
+    uint16_t samples;
+};
 static constexpr TickType_t AFE_FETCH_WAIT_TICKS = pdMS_TO_TICKS(100);
 
 static void reset_state()
@@ -87,19 +92,20 @@ static void afe_fetch_worker(void *arg)
          * Queue copies the PCM, so the AFE result buffer remains owned by
          * ESP-SR and is never referenced after this iteration.
          */
-        int16_t frame[512] = {};
-        if (samples > sizeof(frame) / sizeof(frame[0])) continue;
-        memcpy(frame, result->data, samples * sizeof(int16_t));
+        afe_output_frame_t frame = {};
+        if (samples > sizeof(frame.pcm) / sizeof(frame.pcm[0])) continue;
+        memcpy(frame.pcm, result->data, samples * sizeof(int16_t));
+        frame.samples = (uint16_t)samples;
 
-        if (xQueueSend(s_output_queue, frame, 0) != pdTRUE) {
+        if (xQueueSend(s_output_queue, &frame, 0) != pdTRUE) {
             /*
              * Output must never block the MIC/feed side. If Gemini is
              * temporarily slower, discard the oldest processed frame and
              * keep the newest one.
              */
-            int16_t stale[512] = {};
-            (void)xQueueReceive(s_output_queue, stale, 0);
-            (void)xQueueSend(s_output_queue, frame, 0);
+            afe_output_frame_t stale = {};
+            (void)xQueueReceive(s_output_queue, &stale, 0);
+            (void)xQueueSend(s_output_queue, &frame, 0);
         }
     }
 
@@ -110,7 +116,7 @@ static void afe_fetch_worker(void *arg)
 static bool start_fetch_task()
 {
     s_output_queue = xQueueCreate(AFE_OUTPUT_QUEUE_DEPTH,
-                                  (UBaseType_t)(s_fetch_samples * sizeof(int16_t)));
+                                  sizeof(afe_output_frame_t));
     if (!s_output_queue) {
         ESP_LOGE(TAG, "AFE output queue allocation failed");
         return false;
@@ -304,9 +310,25 @@ extern "C" bool afe_audio_fetch_output(int16_t *output,
         output_capacity_samples < (size_t)s_fetch_samples) {
         return false;
     }
-    if (xQueueReceive(s_output_queue, output, 0) != pdTRUE) return true;
-    *output_samples = (size_t)s_fetch_samples;
+    afe_output_frame_t frame = {};
+    if (xQueueReceive(s_output_queue, &frame, 0) != pdTRUE) return true;
+    if (frame.samples == 0 || frame.samples > (uint16_t)s_fetch_samples) {
+        ESP_LOGW(TAG, "AFE output queue frame invalid samples=%u fetch=%d",
+                 (unsigned)frame.samples, s_fetch_samples);
+        return true;
+    }
+    memcpy(output, frame.pcm, (size_t)frame.samples * sizeof(int16_t));
+    *output_samples = (size_t)frame.samples;
     return true;
+}
+
+extern "C" void afe_audio_flush_output(void)
+{
+    if (!s_output_queue) return;
+    afe_output_frame_t stale = {};
+    size_t flushed = 0;
+    while (xQueueReceive(s_output_queue, &stale, 0) == pdTRUE) ++flushed;
+    if (flushed) ESP_LOGI(TAG, "AFE output queue flushed: %u frame", (unsigned)flushed);
 }
 
 extern "C" int afe_audio_get_feed_samples(void) { return s_feed_samples; }
