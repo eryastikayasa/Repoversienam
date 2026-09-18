@@ -290,15 +290,22 @@ extern "C" bool afe_audio_process(const int16_t *input, size_t input_samples,
         return false;
     }
 
-    /*
-     * A fetch result may not exist for this feed yet. That is normal.
-     * Returning true with zero output lets the MIC task continue feeding
-     * without dropping its 160-sample input chunk.
-     */
-    if (xQueueReceive(s_output_queue, output, 0) == pdTRUE) {
-        *output_samples = (size_t)s_fetch_samples;
-    }
+    /* Output consumption is separate; caller drains all ready frames. */
+    (void)output;
+    return true;
+}
 
+extern "C" bool afe_audio_fetch_output(int16_t *output,
+                                       size_t output_capacity_samples,
+                                       size_t *output_samples)
+{
+    if (output_samples) *output_samples = 0;
+    if (!afe_audio_is_ready() || !output || !output_samples ||
+        output_capacity_samples < (size_t)s_fetch_samples) {
+        return false;
+    }
+    if (xQueueReceive(s_output_queue, output, 0) != pdTRUE) return true;
+    *output_samples = (size_t)s_fetch_samples;
     return true;
 }
 
