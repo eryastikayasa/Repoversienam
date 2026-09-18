@@ -386,6 +386,18 @@ extern "C" void app_main()
     }
 
     while (1) {
+        if (websocket_standby_requested()) {
+            websocket_clear_standby_request();
+            if (assistant_active) {
+                ESP_LOGI(TAG, "Standby Gemini: menutup sesi dan mengaktifkan Wake Word");
+                assistant_active = false;
+                face_set_state(FACE_SLEEP);
+                websocket_disconnect();
+                last_user_activity_us = 0;
+                connect_start_us = 0;
+            }
+        }
+
         if (!assistant_active) {
             if (wakeword_detected()) {
                 wakeword_clear_detected();
