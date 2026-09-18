@@ -174,6 +174,7 @@ bool build_gemini_setup(char **output, size_t *output_len)
     cJSON_AddStringToObject(prebuilt, "voiceName", "Kore");
     cJSON_AddStringToObject(setup, "model", "models/gemini-3.1-flash-live-preview");
     cJSON_AddObjectToObject(setup, "inputAudioTranscription");
+    cJSON_AddObjectToObject(setup, "outputAudioTranscription");
 
     cJSON *system_instruction = cJSON_AddObjectToObject(setup, "systemInstruction");
     cJSON *system_parts = cJSON_AddArrayToObject(system_instruction, "parts");
@@ -388,30 +389,29 @@ void process_gemini_message(const char *json, size_t len)
     if (cJSON_IsObject(tool_call))
         process_gemini_tool_call(tool_call);
 
-    cJSON *input_transcription = cJSON_GetObjectItem(root, "inputTranscription");
-    if (cJSON_IsObject(input_transcription)) {
-        cJSON *text = cJSON_GetObjectItem(input_transcription, "text");
-        if (cJSON_IsString(text) && text->valuestring) {
-            ESP_LOGI(TAG, "USER: %s", text->valuestring);
-            /* Keep the existing Repo6 display typing engine authoritative.
-             * It handles common-prefix updates and 55 ms/character reveal. */
-            display_text_set_user(text->valuestring);
-        }
-    }
-
-    cJSON *output_transcription = cJSON_GetObjectItem(root, "outputTranscription");
-    if (cJSON_IsObject(output_transcription)) {
-        cJSON *text = cJSON_GetObjectItem(output_transcription, "text");
-        if (cJSON_IsString(text) && text->valuestring) {
-            ESP_LOGI(TAG, "GEMINI TEXT: %s", text->valuestring);
-            /* Feed transcription into the locked Repo6 display renderer.
-             * No new timer/scroll logic is added here. */
-            display_text_set_gemini(text->valuestring);
-        }
-    }
-
     cJSON *server = cJSON_GetObjectItem(root, "serverContent");
     if (cJSON_IsObject(server)) {
+        /* Gemini Live sends input/output transcription inside serverContent.
+         * Keep the locked Repo6 display engine responsible for the 55 ms
+         * typing reveal; this layer only feeds the transcript text. */
+        cJSON *input_transcription = cJSON_GetObjectItem(server, "inputTranscription");
+        if (cJSON_IsObject(input_transcription)) {
+            cJSON *text = cJSON_GetObjectItem(input_transcription, "text");
+            if (cJSON_IsString(text) && text->valuestring) {
+                ESP_LOGI(TAG, "USER: %s", text->valuestring);
+                display_text_set_user(text->valuestring);
+            }
+        }
+
+        cJSON *output_transcription = cJSON_GetObjectItem(server, "outputTranscription");
+        if (cJSON_IsObject(output_transcription)) {
+            cJSON *text = cJSON_GetObjectItem(output_transcription, "text");
+            if (cJSON_IsString(text) && text->valuestring) {
+                ESP_LOGI(TAG, "GEMINI TEXT: %s", text->valuestring);
+                display_text_set_gemini(text->valuestring);
+            }
+        }
+
         cJSON *turn = cJSON_GetObjectItem(server, "modelTurn");
         if (cJSON_IsObject(turn)) {
             cJSON *parts = cJSON_GetObjectItem(turn, "parts");
