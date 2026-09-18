@@ -23,7 +23,7 @@ static bool send_tool_payload(const char *id, const char *name, const char *resu
 {
     if (!id || !name || !result || !client || !is_connected || websocket_tx_error) return false;
     if (!esp_websocket_client_is_connected(client)) return false;
-    if (strcmp(name, "control_device") != 0) return false;
+    if (strcmp(name, "control_device") != 0 && strcmp(name, "standby_gemini") != 0) return false;
     if (!valid_tool_id(id)) {
         ESP_LOGW(TAG, "Tool call id ditolak karena karakter tidak aman");
         return false;
