@@ -187,7 +187,9 @@ static bool boot_button_long_pressed(void)
     io.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&io);
 
-    if (gpio_get_level(CONFIG_BOOT_BUTTON_GPIO) != 0) return false;
+    if (gpio_get_level(CONFIG_BOOT_BUTTON_GPIO) != 0) {
+        return false;
+    }
 
     ESP_LOGI(TAG, "GPIO0 ditekan saat boot, cek long-press %d ms...", CONFIG_LONG_PRESS_MS);
     const int step_ms = 50;
@@ -216,7 +218,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
-    static EXT_RAM_BSS_ATTR char content[8192];
+    static EXT_RAM_BSS_ATTR char content[2048];
     int total = 0;
     while (total < (int)sizeof(content) - 1) {
         int received = httpd_req_recv(req, content + total, sizeof(content) - 1 - total);
@@ -228,7 +230,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     char wifi_ssid[64] = "";
     char wifi_pass[64] = "";
     char api_key[128] = "";
-    char role_text[2048] = "";
+    char role_text[512] = "";
 
     char *saveptr = NULL;
     char *token = strtok_r(content, "&", &saveptr);
@@ -238,7 +240,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
             *eq = '\0';
             const char *key = token;
             const char *value = eq + 1;
-            char decoded[2048] = "";
+            char decoded[512] = "";
             url_decode(decoded, sizeof(decoded), value);
 
             if (strcmp(key, "wifi_ssid") == 0) {
@@ -281,7 +283,9 @@ extern "C" {
 
 bool web_config_is_needed(void)
 {
-    if (boot_button_long_pressed()) return true;
+    if (boot_button_long_pressed()) {
+        return true;
+    }
 
     nvs_handle_t handle;
     if (nvs_open(CONFIG_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return true;
