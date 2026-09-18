@@ -24,7 +24,7 @@ static int s_sample_rate = 0;
 
 /*
  * WakeWord/ESP-SR style feed/fetch decoupling:
- * - caller feeds exact AFE chunks (160 samples)
+ * - caller feeds exact AFE chunks reported by get_feed_chunksize()
  * - dedicated fetch task waits for AFE processing results
  * - processed PCM is queued back to the Gemini audio path
  *
@@ -212,7 +212,7 @@ extern "C" bool afe_audio_init(void)
     s_fetch_samples = s_handle->get_fetch_chunksize(s_data);
     s_sample_rate = s_handle->get_samp_rate(s_data);
 
-    if (s_feed_samples <= 0 || s_fetch_samples <= 0 || s_sample_rate != 16000) {
+    if (s_feed_samples <= 0 || s_fetch_samples <= 0 || s_fetch_samples > 512 || s_sample_rate != 16000) {
         ESP_LOGE(TAG, "Unexpected AFE format: feed=%d fetch=%d rate=%d",
                  s_feed_samples, s_fetch_samples, s_sample_rate);
         s_handle->destroy(s_data);
@@ -281,8 +281,9 @@ extern "C" bool afe_audio_process(const int16_t *input, size_t input_samples,
     }
 
     /*
-     * Feed is intentionally non-blocking. Fetch is handled by the dedicated
-     * ESP-SR task, following the same feed/fetch separation used by WakeWord.
+     * Feed is intentionally non-blocking. The caller supplies exactly the
+     * runtime get_feed_chunksize() value; fetch is handled independently by
+     * the dedicated ESP-SR task.
      */
     const int fed = s_handle->feed(s_data, input);
     if (fed <= 0) {
