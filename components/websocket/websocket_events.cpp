@@ -48,7 +48,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
             request_audio_buffer_clear();
-            display_status("AI Terhubung...");
+            display_text_set_status("AI Terhubung...");
             websocket_schedule_setup(websocket_connection_generation);
             break;
 
@@ -86,8 +86,8 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             is_connected = false;
             setup_complete = false;
             websocket_tx_error = true;
-            face_set_state(FACE_ERROR);
-            display_status("AI Error!");
+            display_face_set_state(FACE_ERROR);
+            display_text_set_status("AI Error!");
             invalidate_connection_generation();
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
@@ -108,7 +108,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
             request_audio_buffer_clear();
-            display_status("AI Disconnected");
+            display_text_set_status("AI Disconnected");
             if (session_resumable && session_handle[0] != '\0')
                 ESP_LOGI(TAG, "Session resumption handle dipertahankan");
             websocket_cleanup_pending = true;
