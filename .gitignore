@@ -1,9 +1,10 @@
 .pio/
 .vscode/
-*.pyc
-__pycache__/
-sdkconfig
-sdkconfig.old
 build/
 managed_components/
 components/managed_components/
+sdkconfig
+sdkconfig.old
+*.pyc
+__pycache__/
+components/websocket/include/gemini_api_key.h
