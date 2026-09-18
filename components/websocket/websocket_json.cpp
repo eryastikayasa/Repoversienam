@@ -289,9 +289,14 @@ static void process_gemini_tool_call(cJSON *tool_call)
         cJSON *name = cJSON_GetObjectItem(fc, "name");
         cJSON *args = cJSON_GetObjectItem(fc, "args");
         if (!cJSON_IsString(id) || !id->valuestring ||
-            !cJSON_IsString(name) || !name->valuestring ||
-            !cJSON_IsObject(args)) {
+            !cJSON_IsString(name) || !name->valuestring) {
             ESP_LOGW(TAG, "Tool call Gemini tidak lengkap");
+            continue;
+        }
+
+        const bool is_standby = strcmp(name->valuestring, "standby_gemini") == 0;
+        if (!is_standby && !cJSON_IsObject(args)) {
+            ESP_LOGW(TAG, "Tool call Gemini tidak lengkap: args wajib object untuk %s", name->valuestring);
             continue;
         }
 
