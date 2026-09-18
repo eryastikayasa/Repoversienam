@@ -2,6 +2,7 @@
 #include "web_config.h"
 #include "audio_hal.h"
 #include "uart_control.h"
+#include "display_text.h"
 
 #include "esp_log.h"
 #include "esp_system.h"
@@ -390,15 +391,23 @@ void process_gemini_message(const char *json, size_t len)
     cJSON *input_transcription = cJSON_GetObjectItem(root, "inputTranscription");
     if (cJSON_IsObject(input_transcription)) {
         cJSON *text = cJSON_GetObjectItem(input_transcription, "text");
-        if (cJSON_IsString(text) && text->valuestring)
+        if (cJSON_IsString(text) && text->valuestring) {
             ESP_LOGI(TAG, "USER: %s", text->valuestring);
+            /* Keep the existing Repo6 display typing engine authoritative.
+             * It handles common-prefix updates and 55 ms/character reveal. */
+            display_text_set_user(text->valuestring);
+        }
     }
 
     cJSON *output_transcription = cJSON_GetObjectItem(root, "outputTranscription");
     if (cJSON_IsObject(output_transcription)) {
         cJSON *text = cJSON_GetObjectItem(output_transcription, "text");
-        if (cJSON_IsString(text) && text->valuestring)
+        if (cJSON_IsString(text) && text->valuestring) {
             ESP_LOGI(TAG, "GEMINI TEXT: %s", text->valuestring);
+            /* Feed transcription into the locked Repo6 display renderer.
+             * No new timer/scroll logic is added here. */
+            display_text_set_gemini(text->valuestring);
+        }
     }
 
     cJSON *server = cJSON_GetObjectItem(root, "serverContent");
