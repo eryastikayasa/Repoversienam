@@ -1,4 +1,5 @@
 name: Build ESP32-S3 Firmware
+# Build verification trigger: standby_gemini
 
 on:
   push:
