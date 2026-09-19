@@ -45,7 +45,6 @@ void websocket_request_standby(void);
 bool websocket_standby_requested(void);
 bool websocket_standby_response_started(void);
 void websocket_mark_standby_response_started(void);
-bool websocket_standby_timeout_expired(void);
 void websocket_clear_standby_request(void);
 bool websocket_cleanup_is_pending(void);
 void websocket_cleanup_complete(void);
