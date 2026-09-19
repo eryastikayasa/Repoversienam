@@ -526,13 +526,23 @@ extern "C" void app_main()
     while (1) {
         if (websocket_standby_requested()) {
             /*
-             * Gemini must get a chance to speak the short standby acknowledgement.
-             * If a model audio turn is active, wait until turnComplete + playback
-             * drain clears audio_turn_active. Do not tear down the Live session
-             * while the acknowledgement is still in the playback ring.
+             * standby_gemini is a shutdown request, not an immediate disconnect.
+             * The tool response must first return control to Gemini so it can
+             * produce the final standby acknowledgement. Only after real model
+             * audio has started and its playback has fully drained do we close
+             * the Live session. A bounded timeout prevents a deadlock if Gemini
+             * never produces the acknowledgement audio.
              */
-            if (assistant_active && !audio_turn_active && !audio_turn_complete_pending) {
-                ESP_LOGI(TAG, "Standby Gemini: respons selesai, menutup sesi dan mengaktifkan Wake Word");
+            const bool response_started = websocket_standby_response_started();
+            const bool response_drained = response_started &&
+                                          !audio_turn_active &&
+                                          !audio_turn_complete_pending;
+            const bool response_timeout = websocket_standby_timeout_expired();
+
+            if (assistant_active && (response_drained || response_timeout)) {
+                ESP_LOGI(TAG,
+                         "Standby Gemini: %s -> menutup sesi dan mengaktifkan Wake Word",
+                         response_drained ? "respons audio selesai + drain" : "timeout respons");
                 websocket_clear_standby_request();
                 assistant_active = false;
                 wait_for_gemini_mic_release();
