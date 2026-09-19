@@ -380,7 +380,7 @@ void process_gemini_message(const char *json, size_t len)
     if (cJSON_IsObject(setup_complete_obj)) {
         setup_complete = true;
         ESP_LOGI(TAG, "Gemini setupComplete: SESI SIAP");
-        display_text_set_status("AI Siap!");
+        display_text_set_status("Silakan bicara...");
         /* Conversation is now ready: leave the wakeword/button HAPPY pose
          * and enter the normal listening state. The locked display renderer
          * remains untouched. */
@@ -424,6 +424,7 @@ void process_gemini_message(const char *json, size_t len)
              * to SPEAKING only when PCM actually reaches the playback path. */
             if (!websocket_standby_requested())
                 display_face_set_state(FACE_THINKING);
+                display_text_set_status("Gemini berpikir...");
 
             cJSON *parts = cJSON_GetObjectItem(turn, "parts");
             if (cJSON_IsArray(parts)) {
