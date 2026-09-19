@@ -307,6 +307,9 @@ void begin_audio_turn(void)
     audio_turn_generation = next_generation;
     audio_turn_active = true;
     audio_turn_complete_pending = false;
+
+    if (websocket_standby_requested())
+        websocket_mark_standby_response_started();
 }
 
 bool queue_audio_pcm(const uint8_t *pcm, size_t len)
