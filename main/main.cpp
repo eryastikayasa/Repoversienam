@@ -642,6 +642,11 @@ extern "C" void app_main()
                     }
                     afe_session_active = true;
 
+                    /* Fresh session: discard transcript from the previous
+                     * Gemini conversation before the new button handoff. */
+                    display_text_set_user("");
+                    display_text_set_gemini("");
+
                     assistant_active = true;
                     connect_start_us = esp_timer_get_time();
                     last_user_activity_us = connect_start_us;
