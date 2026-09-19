@@ -242,6 +242,8 @@ static bool assistant_active = false;
 static int64_t last_user_activity_us = 0;
 static int64_t connect_start_us = 0;
 static volatile bool audio_task_reading = false;
+/* True while the current Gemini session owns a live AFE instance. */
+static volatile bool afe_session_active = false;
 
 static void wait_for_gemini_mic_release(void)
 {
@@ -272,16 +274,17 @@ static void audio_task(void *arg)
 
     while (1) {
         if (!assistant_active) {
-            /*
-             * Session boundary: never carry PCM from the previous Gemini
-             * conversation into the next one. The AFE instance is kept alive
-             * for the lifetime of audio_task, so explicitly clear both the
-             * local staging state and any processed frames still queued by
-             * the asynchronous AFE fetch task.
-             */
+            /* Gemini owns AFE only for an active session. Deinitialize it
+             * from audio_task itself so no other task can destroy the AFE
+             * while this task is still feeding/flushing it. */
+            if (afe_session_active) {
+                ESP_LOGI(TAG, "AFE SESSION: stopping Gemini AFE at session boundary");
+                afe_audio_deinit();
+                afe_session_active = false;
+                ESP_LOGI(TAG, "AFE SESSION: Gemini AFE deinitialized");
+            }
             buffer_pos = 0;
             afe_staging_samples = 0;
-            afe_audio_flush_output();
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -525,31 +528,34 @@ extern "C" void app_main()
 
     while (1) {
         if (websocket_standby_requested()) {
-            /*
-             * Standby is an isolated shutdown path. Do not disconnect merely
-             * because the previous Gemini turn has already drained: after the
-             * toolResponse, Gemini still needs time to generate the standby
-             * acknowledgement. Shutdown starts only after that new response
-             * actually begins and its playback has fully drained.
-             */
+            /* STANDBY-ONLY PATH. Normal Gemini turns never enter this
+             * shutdown sequence. standby_gemini only marks shutdown pending;
+             * Gemini must be allowed to produce its final spoken response. */
             const bool response_started = websocket_standby_response_started();
             const bool response_drained = response_started &&
                                           !audio_turn_active &&
                                           !audio_turn_complete_pending;
-            const bool response_timeout = websocket_standby_timeout_expired();
 
-            if (assistant_active && (response_drained || response_timeout)) {
-                ESP_LOGI(TAG,
-                         "Standby Gemini: %s -> menutup sesi dan mengaktifkan Wake Word",
-                         response_drained ? "respons audio selesai + drain" : "timeout respons");
-                websocket_clear_standby_request();
+            if (assistant_active && response_drained) {
+                ESP_LOGI(TAG, "Standby Gemini: final response audio drained -> shutdown");
+
+                /* Stop microphone ownership first; audio_task then performs
+                 * the AFE deinit at its own session boundary. */
                 assistant_active = false;
                 wait_for_gemini_mic_release();
+
+                /* Do not start WakeWord/new Gemini until the old AFE fetch
+                 * task and instance are completely gone. */
+                while (afe_session_active)
+                    vTaskDelay(pdMS_TO_TICKS(1));
+
+                websocket_clear_standby_request();
                 face_set_state(FACE_SLEEP);
                 display_status("Katakan: Hi, ESP");
                 websocket_disconnect();
                 last_user_activity_us = 0;
                 connect_start_us = 0;
+                ESP_LOGI(TAG, "Standby Gemini: WebSocket disconnected, Wake Word may resume");
             }
         }
 
@@ -563,6 +569,8 @@ extern "C" void app_main()
                     face_set_state(FACE_ERROR);
                     continue;
                 }
+                afe_session_active = true;
+
                 assistant_active = true;
                 connect_start_us = esp_timer_get_time();
                 last_user_activity_us = connect_start_us;
@@ -584,6 +592,8 @@ extern "C" void app_main()
                         face_set_state(FACE_ERROR);
                         continue;
                     }
+                    afe_session_active = true;
+
                     assistant_active = true;
                     connect_start_us = esp_timer_get_time();
                     last_user_activity_us = connect_start_us;
