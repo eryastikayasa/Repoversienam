@@ -28,6 +28,50 @@ static int s_current_gaze_y = 0;
 static int s_current_micro_x = 0;
 static int s_current_micro_y = 0;
 
+struct spring1d_t {
+    float current = 0.0f;
+    float target = 0.0f;
+    float velocity = 0.0f;
+
+    void reset(float value = 0.0f)
+    {
+        current = value;
+        target = value;
+        velocity = 0.0f;
+    }
+
+    void update(float dt, float omega, float zeta)
+    {
+        if (dt <= 0.0f) return;
+        if (dt > 0.033f) dt = 0.033f;
+
+        const float f = 1.0f + 2.0f * dt * zeta * omega;
+        const float oo = omega * omega;
+        const float h = dt * oo;
+        const float det = f + dt * h;
+
+        const float new_velocity =
+            (velocity + h * (target - current)) / det;
+
+        current += new_velocity * dt;
+        velocity = new_velocity;
+    }
+};
+
+// Second-order motion keeps the eye shape and pupil alive without heap use.
+// The eye moves first; the pupil follows with a small physical lag.
+static spring1d_t s_eye_motion_x;
+static spring1d_t s_eye_motion_y;
+static spring1d_t s_pupil_motion_x;
+static spring1d_t s_pupil_motion_y;
+
+// Eyebrow springs: expressive, subtle, and coupled to the same face motion.
+static spring1d_t s_brow_left_y;
+static spring1d_t s_brow_right_y;
+static spring1d_t s_brow_left_angle;
+static spring1d_t s_brow_right_angle;
+static uint32_t s_last_motion_ms = 0;
+
 // Internal idle behavior. It is deliberately event/time based: the face can rest.
 enum idle_behavior_t : uint8_t {
     IDLE_REST = 0,
@@ -56,6 +100,10 @@ enum mouth_shape_t : uint8_t {
 static mouth_shape_t s_mouth_shape = MOUTH_CLOSED;
 static uint32_t s_mouth_shape_until_ms = 0;
 static uint8_t s_mouth_shape_count = 0;
+
+// Continuous speech aperture: the scheduler selects syllable-like targets,
+// while a spring makes the mouth visibly open/close instead of snapping.
+static spring1d_t s_mouth_motion;
 
 // Short behavioral transition between expressions/states.
 static uint32_t s_transition_started_ms = 0;
@@ -132,36 +180,51 @@ static void fill_circle(int cx, int cy, int radius)
     }
 }
 
-static void draw_cat_ears(int offset_y)
-{
-    line(18, 14 + offset_y, 20, 4 + offset_y);
-    line(20, 4 + offset_y, 30, 13 + offset_y);
-    line(98, 13 + offset_y, 108, 4 + offset_y);
-    line(108, 4 + offset_y, 110, 14 + offset_y);
-    line(21, 11 + offset_y, 23, 8 + offset_y);
-    line(23, 8 + offset_y, 27, 12 + offset_y);
-    line(101, 12 + offset_y, 105, 8 + offset_y);
-    line(105, 8 + offset_y, 107, 11 + offset_y);
-}
-
 static void draw_open_eye(int cx, int cy, int gaze_x, int gaze_y,
-                          int eye_shift_x, int eye_shift_y, int openness = 14)
+                          int eye_shift_x, int eye_shift_y, int openness = 14,
+                          float tilt = 0.0f)
 {
     const int eye_radius = clamp_i(openness, 9, 14);
-    const int pupil_radius = eye_radius >= 13 ? 7 : 6;
+    const int pupil_radius = eye_radius >= 13 ? 5 : 4;
     gaze_x = clamp_i(gaze_x, -7, 7);
     gaze_y = clamp_i(gaze_y, -5, 5);
+
     const int eye_x = cx + eye_shift_x;
     const int eye_y = cy + eye_shift_y;
+
+    // Organic 1-bit OLED eye silhouette.
+    const float ct = cosf(tilt);
+    const float st = sinf(tilt);
+    for (int y = -eye_radius; y <= eye_radius; ++y) {
+        for (int x = -eye_radius; x <= eye_radius; ++x) {
+            const float ex = (float)x / (float)eye_radius;
+            const float ey = (float)y / (float)eye_radius;
+            const float shape = ex * ex + ey * ey;
+            if (shape <= 1.0f) {
+                const float rx = (float)x * ct - (float)y * st;
+                const float ry = (float)x * st + (float)y * ct;
+                const float organic = 1.0f
+                    + 0.045f * sinf((float)(x + y) * 0.55f)
+                    + 0.035f * cosf((float)y * 0.70f);
+                if ((rx * rx + ry * ry) <=
+                    (float)(eye_radius * eye_radius) * organic) {
+                    pixel(eye_x + x, eye_y + y);
+                }
+            }
+        }
+    }
+
+    // Pupil has its own smooth tracking, while following the moving eyeball.
     const int pupil_x = eye_x + gaze_x;
     const int pupil_y = eye_y + gaze_y;
-    fill_circle(eye_x, eye_y, eye_radius);
+    fill_circle(pupil_x, pupil_y, pupil_radius);
     for (int y = -pupil_radius; y <= pupil_radius; ++y) {
         const int q = pupil_radius * pupil_radius - y * y;
         const int dx = q > 0 ? (int)sqrtf((float)q) : 0;
         for (int x = -dx; x <= dx; ++x) pixel(pupil_x + x, pupil_y + y, false);
     }
-    fill_circle(pupil_x - 2, pupil_y - 3, 2);
+    // Small OLED catchlight.
+    pixel(pupil_x - 1, pupil_y - 2);
 }
 
 static void draw_blink_eye(int cx, int cy, int openness)
@@ -177,14 +240,13 @@ static void draw_blink_eye(int cx, int cy, int openness)
     line(cx + half, cy, cx + 11, cy + 1);
 }
 
-static void draw_happy_eye(int cx, int cy)
+static void draw_happy_eye(int cx, int cy,
+                            int gaze_x = 0, int gaze_y = 0,
+                            int eye_shift_x = 0, int eye_shift_y = 0,
+                            float tilt = 0.0f)
 {
-    for (int x = -12; x <= 12; ++x) {
-        const float t = (float)x / 12.0f;
-        const int y = (int)(6.0f * (1.0f - t * t));
-        pixel(cx + x, cy + y);
-        if ((x & 1) == 0) pixel(cx + x, cy + y + 1);
-    }
+    draw_open_eye(cx, cy, gaze_x, gaze_y,
+                  eye_shift_x, eye_shift_y, 7, tilt);
 }
 
 static void draw_normal_brow(int cx, int cy, int lift = 0)
@@ -225,12 +287,12 @@ static void draw_sad_brow(int cx, int cy, bool left_eye)
     }
 }
 
-static void draw_sad_eye(int cx, int cy, int gaze_y)
+static void draw_sad_eye(int cx, int cy, int gaze_y,
+                          int eye_shift_x = 0, int eye_shift_y = 0,
+                          float tilt = 0.0f)
 {
-    const int y = cy + gaze_y;
-    line(cx - 11, y, cx - 5, y + 2);
-    line(cx - 5, y + 2, cx + 5, y + 2);
-    line(cx + 5, y + 2, cx + 11, y);
+    draw_open_eye(cx, cy, 0, gaze_y,
+                  eye_shift_x, eye_shift_y, 10, tilt);
 }
 
 static void draw_sleep_eye(int cx, int cy, int lid)
@@ -251,27 +313,84 @@ static void draw_error_eye(int cx, int cy, int pulse)
 static void draw_mouth(mouth_shape_t shape, int offset_y)
 {
     const int cx = 64;
-    const int cy = 53 + offset_y;
+    const int cy = 51 + offset_y;
+
+    // Mouth language follows the supplied OLED reference:
+    // compact, thick 1-bit curves rather than a large cartoon mouth.
     switch (shape) {
         case MOUTH_CLOSED:
-            line(cx - 5, cy, cx + 5, cy);
+            line(cx - 7, cy + 1, cx - 3, cy);
+            line(cx - 3, cy, cx + 3, cy);
+            line(cx + 3, cy, cx + 7, cy + 1);
+            line(cx - 3, cy + 3, cx + 3, cy + 3);
             break;
+
         case MOUTH_SMALL:
-            line(cx - 4, cy - 1, cx, cy + 1);
-            line(cx, cy + 1, cx + 4, cy - 1);
+            line(cx - 6, cy + 1, cx - 2, cy);
+            line(cx - 2, cy, cx + 2, cy);
+            line(cx + 2, cy, cx + 6, cy + 1);
             break;
+
         case MOUTH_MEDIUM:
-            line(cx - 5, cy - 2, cx, cy + 3);
-            line(cx, cy + 3, cx + 5, cy - 2);
-            line(cx - 5, cy - 2, cx + 5, cy - 2);
+            line(cx - 7, cy, cx - 3, cy - 2);
+            line(cx - 3, cy - 2, cx + 3, cy - 2);
+            line(cx + 3, cy - 2, cx + 7, cy);
+            line(cx - 4, cy + 3, cx + 4, cy + 3);
             break;
+
         case MOUTH_WIDE:
-            line(cx - 7, cy - 2, cx, cy + 4);
-            line(cx, cy + 4, cx + 7, cy - 2);
-            line(cx - 7, cy - 2, cx + 7, cy - 2);
-            line(cx - 3, cy + 1, cx + 3, cy + 1);
+            line(cx - 8, cy - 1, cx - 4, cy - 3);
+            line(cx - 4, cy - 3, cx + 4, cy - 3);
+            line(cx + 4, cy - 3, cx + 8, cy - 1);
+            line(cx - 6, cy + 2, cx + 6, cy + 2);
             break;
     }
+}
+
+static void draw_speaking_mouth(float aperture, int offset_y)
+{
+    const int cx = 64;
+    const int cy = 51 + offset_y;
+
+    aperture = aperture < 0.0f ? 0.0f : (aperture > 1.0f ? 1.0f : aperture);
+
+    // Compact 1-bit mouth. The opening breathes between nearly closed and
+    // wide speech shapes; no large cartoon mouth is introduced.
+    const int half_w = 4 + (int)lroundf(aperture * 4.0f);
+    const int top = cy - 1 - (int)lroundf(aperture * 3.0f);
+    const int bottom = cy + 1 + (int)lroundf(aperture * 3.0f);
+
+    line(cx - half_w, top, cx - half_w / 2, top - 1);
+    line(cx - half_w / 2, top - 1, cx + half_w / 2, top - 1);
+    line(cx + half_w / 2, top - 1, cx + half_w, top);
+
+    if (aperture > 0.18f) {
+        line(cx - half_w, bottom, cx + half_w, bottom);
+    }
+
+    // A tiny center contraction keeps fast speech from looking like a static
+    // open rectangle at low OLED resolution.
+    if (aperture > 0.65f) {
+        line(cx - 3, cy + 1, cx + 3, cy + 1);
+    }
+}
+
+static void draw_brow_physics(float cx, float cy, float length,
+                              float angle_deg, float offset_y)
+{
+    const float rad = angle_deg * (3.14159265358979323846f / 180.0f);
+    const float half = length * 0.5f;
+    const float cs = cosf(rad);
+    const float sn = sinf(rad);
+
+    const int x1 = (int)lroundf(cx - half * cs);
+    const int y1 = (int)lroundf(cy + offset_y - half * sn);
+    const int x2 = (int)lroundf(cx + half * cs);
+    const int y2 = (int)lroundf(cy + offset_y + half * sn);
+
+    // Two-pixel OLED stroke gives the thick eyebrow seen in the reference.
+    line(x1, y1, x2, y2);
+    line(x1, y1 + 1, x2, y2 + 1);
 }
 
 static uint32_t elapsed_ms(uint32_t now_ms)
@@ -443,47 +562,181 @@ static int blink_openness(uint32_t now_ms)
     return (int)(((t - half) * 14U) / half);
 }
 
+static float mouth_shape_aperture(mouth_shape_t shape)
+{
+    switch (shape) {
+        case MOUTH_CLOSED: return 0.04f;
+        case MOUTH_SMALL:  return 0.28f;
+        case MOUTH_MEDIUM: return 0.62f;
+        case MOUTH_WIDE:   return 1.0f;
+        default:           return 0.04f;
+    }
+}
+
 static void update_mouth_scheduler(uint32_t now_ms, face_state_t state)
 {
     if (state != FACE_SPEAKING) {
         s_mouth_shape = MOUTH_CLOSED;
         s_mouth_shape_until_ms = now_ms;
         s_mouth_shape_count = 0;
+        s_mouth_motion.target = 0.0f;
+        s_mouth_motion.update(0.016f, 20.0f, 0.90f);
         return;
     }
 
-    if ((int32_t)(now_ms - s_mouth_shape_until_ms) < 0) return;
+    if ((int32_t)(now_ms - s_mouth_shape_until_ms) >= 0) {
+        mouth_shape_t next;
+        const int roll = rand_range(0, 99);
 
-    mouth_shape_t next = MOUTH_SMALL;
-    const int roll = rand_range(0, 99);
-    if (s_mouth_shape_count == 0) {
-        next = roll < 35 ? MOUTH_CLOSED : MOUTH_SMALL;
-    } else if (roll < 28) {
-        next = MOUTH_CLOSED;
-    } else if (roll < 65) {
-        next = MOUTH_SMALL;
-    } else if (roll < 90) {
-        next = MOUTH_MEDIUM;
-    } else {
-        next = MOUTH_WIDE;
+        // Short syllable-like rhythm: mostly small/medium openings, with
+        // occasional closure and wide peaks. Avoid the same shape twice.
+        if (s_mouth_shape_count == 0) {
+            next = roll < 22 ? MOUTH_CLOSED : MOUTH_SMALL;
+        } else if (roll < 12) {
+            next = MOUTH_CLOSED;
+        } else if (roll < 54) {
+            next = MOUTH_SMALL;
+        } else if (roll < 88) {
+            next = MOUTH_MEDIUM;
+        } else {
+            next = MOUTH_WIDE;
+        }
+
+        if (next == s_mouth_shape) {
+            if (next == MOUTH_SMALL) next = MOUTH_MEDIUM;
+            else if (next == MOUTH_MEDIUM) next = MOUTH_SMALL;
+            else if (next == MOUTH_WIDE) next = MOUTH_MEDIUM;
+            else next = MOUTH_SMALL;
+        }
+
+        s_mouth_shape = next;
+        ++s_mouth_shape_count;
+        s_mouth_motion.target = mouth_shape_aperture(next);
+
+        // 55-125 ms produces visible speech movement at the Repo7 ~20 FPS
+        // display cadence without turning the mouth into noisy jitter.
+        s_mouth_shape_until_ms = now_ms + (uint32_t)rand_range(55, 125);
     }
 
-    // Avoid an obvious repeating ramp while retaining occasional wide speech.
-    if (next == s_mouth_shape && next != MOUTH_CLOSED) {
-        next = (next == MOUTH_SMALL) ? MOUTH_MEDIUM : MOUTH_SMALL;
+    float dt = 0.016f;
+    static uint32_t last_ms = 0;
+    if (last_ms != 0) {
+        dt = (float)(now_ms - last_ms) * 0.001f;
+        if (dt < 0.008f) dt = 0.008f;
+        if (dt > 0.033f) dt = 0.033f;
     }
-    s_mouth_shape = next;
-    ++s_mouth_shape_count;
-    s_mouth_shape_until_ms = now_ms + (uint32_t)rand_range(60, 160);
+    last_ms = now_ms;
+    s_mouth_motion.update(dt, 24.0f, 0.82f);
+}
+
+static void update_brow_targets(face_state_t state)
+{
+    // Coordinates are relative to the eye center. The eyebrow is deliberately
+    // compact and expressive, matching the supplied 128x64 reference.
+    switch (state) {
+        case FACE_IDLE:
+            s_brow_left_y.target = -16.0f;
+            s_brow_right_y.target = -16.0f;
+            s_brow_left_angle.target = -3.0f;
+            s_brow_right_angle.target = 3.0f;
+            break;
+
+        case FACE_LISTENING:
+            s_brow_left_y.target = -18.0f;
+            s_brow_right_y.target = -18.0f;
+            s_brow_left_angle.target = -2.0f;
+            s_brow_right_angle.target = 2.0f;
+            break;
+
+        case FACE_THINKING:
+            // Asymmetric Vector-like thinking pose.
+            s_brow_left_y.target = -15.0f;
+            s_brow_right_y.target = -19.0f;
+            s_brow_left_angle.target = 18.0f;
+            s_brow_right_angle.target = -10.0f;
+            break;
+
+        case FACE_SPEAKING:
+            s_brow_left_y.target = -17.0f;
+            s_brow_right_y.target = -17.0f;
+            s_brow_left_angle.target = 0.0f;
+            s_brow_right_angle.target = 0.0f;
+            break;
+
+        case FACE_HAPPY:
+            s_brow_left_y.target = -19.0f;
+            s_brow_right_y.target = -19.0f;
+            s_brow_left_angle.target = -8.0f;
+            s_brow_right_angle.target = 8.0f;
+            break;
+
+        case FACE_SAD:
+            s_brow_left_y.target = -14.0f;
+            s_brow_right_y.target = -14.0f;
+            s_brow_left_angle.target = -18.0f;
+            s_brow_right_angle.target = 18.0f;
+            break;
+
+        case FACE_ERROR:
+            s_brow_left_y.target = -15.0f;
+            s_brow_right_y.target = -15.0f;
+            s_brow_left_angle.target = 20.0f;
+            s_brow_right_angle.target = -20.0f;
+            break;
+
+        case FACE_SLEEP:
+            s_brow_left_y.target = -16.0f;
+            s_brow_right_y.target = -16.0f;
+            s_brow_left_angle.target = 0.0f;
+            s_brow_right_angle.target = 0.0f;
+            break;
+    }
 }
 
 static void update_motion(uint32_t now_ms, face_state_t state)
 {
     schedule_behavior(now_ms, state);
-    s_current_gaze_x = smooth_step(s_current_gaze_x, s_target_gaze_x, 18);
-    s_current_gaze_y = smooth_step(s_current_gaze_y, s_target_gaze_y, 16);
-    s_current_micro_x = smooth_step(s_current_micro_x, s_target_micro_x, 14);
-    s_current_micro_y = smooth_step(s_current_micro_y, s_target_micro_y, 14);
+    update_brow_targets(state);
+
+    float dt = 0.016f;
+    if (s_last_motion_ms != 0) {
+        dt = (float)(now_ms - s_last_motion_ms) * 0.001f;
+        if (dt < 0.008f) dt = 0.008f;
+        if (dt > 0.033f) dt = 0.033f;
+    }
+    s_last_motion_ms = now_ms;
+
+    // The white eye shape has a smaller, slower excursion.
+    s_eye_motion_x.target =
+        (float)s_target_gaze_x * 0.45f + (float)s_target_micro_x * 0.80f;
+    s_eye_motion_y.target =
+        (float)s_target_gaze_y * 0.38f + (float)s_target_micro_y * 0.80f;
+
+    s_eye_motion_x.target = (float)clamp_i((int)lroundf(s_eye_motion_x.target), -3, 3);
+    s_eye_motion_y.target = (float)clamp_i((int)lroundf(s_eye_motion_y.target), -2, 2);
+
+    // Pupil follows the intended gaze and slightly follows eye inertia.
+    s_pupil_motion_x.target =
+        (float)s_target_gaze_x + s_eye_motion_x.current * 0.18f;
+    s_pupil_motion_y.target =
+        (float)s_target_gaze_y + s_eye_motion_y.current * 0.18f;
+
+    s_eye_motion_x.update(dt, 10.5f, 0.72f);
+    s_eye_motion_y.update(dt, 10.5f, 0.72f);
+    s_pupil_motion_x.update(dt, 18.0f, 0.82f);
+    s_pupil_motion_y.update(dt, 18.0f, 0.82f);
+
+    s_brow_left_y.update(dt, 16.0f, 0.80f);
+    s_brow_right_y.update(dt, 16.0f, 0.80f);
+    s_brow_left_angle.update(dt, 16.0f, 0.80f);
+    s_brow_right_angle.update(dt, 16.0f, 0.80f);
+
+    s_current_gaze_x = clamp_i((int)lroundf(s_pupil_motion_x.current), -6, 6);
+    s_current_gaze_y = clamp_i((int)lroundf(s_pupil_motion_y.current), -5, 5);
+
+    // Keep the legacy integer micro state for the transition/legacy renderer.
+    s_current_micro_x = smooth_step(s_current_micro_x, s_target_micro_x, 18);
+    s_current_micro_y = smooth_step(s_current_micro_y, s_target_micro_y, 18);
 }
 
 static void render_face(uint32_t now_ms)
@@ -509,17 +762,16 @@ static void render_face(uint32_t now_ms)
     bool sad_eyes = false;
     bool sleep_eyes = false;
     bool error_eyes = false;
-    bool curious = false;
 
     switch (state) {
         case FACE_IDLE:
-            curious = s_idle_behavior == IDLE_CURIOUS;
             if (s_idle_behavior == IDLE_CURIOUS) offset_x = clamp_i(offset_x, -1, 1);
             break;
         case FACE_LISTENING:
             gaze_x = clamp_i(gaze_x, -3, 3);
             gaze_y = clamp_i(gaze_y, -2, 2);
-            offset_y -= 1;
+            // Keep the eye baseline fixed; listening is expressed by gaze/blink,
+            // not by moving the whole face vertically.
             eye_open = s_blink_phase == 0 ? 14 : eye_open;
             break;
         case FACE_THINKING:
@@ -536,7 +788,6 @@ static void render_face(uint32_t now_ms)
         case FACE_SAD:
             sad_eyes = true;
             gaze_y = 3;
-            offset_y += 1;
             break;
         case FACE_ERROR:
             error_eyes = true;
@@ -561,59 +812,55 @@ static void render_face(uint32_t now_ms)
         else if (s_transition_to == FACE_ERROR) offset_x += pulse;
     }
 
-    draw_cat_ears(offset_y);
+    const int eye_motion_x = clamp_i((int)lroundf(s_eye_motion_x.current), -3, 3);
+    const int eye_motion_y = clamp_i((int)lroundf(s_eye_motion_y.current), -2, 2);
+    const float eye_tilt = clamp_i((int)lroundf(s_eye_motion_x.velocity * 0.35f), -2, 2) * 0.035f;
+
     const int left_x = 34 + offset_x;
     const int right_x = 94 + offset_x;
     const int eye_y = 28 + offset_y;
 
     if (sleep_eyes) {
-        draw_sleep_eye(left_x, eye_y + 1, 1);
-        draw_sleep_eye(right_x, eye_y + 1, 1);
+        draw_sleep_eye(left_x, eye_y, 1);
+        draw_sleep_eye(right_x, eye_y, 1);
     } else if (error_eyes) {
         const int pulse = (t < 600U && ((t / 260U) & 1U)) ? 1 : 0;
         draw_error_eye(left_x, eye_y, pulse);
         draw_error_eye(right_x, eye_y, pulse);
     } else if (happy_eyes) {
-        draw_happy_eye(left_x, eye_y);
-        draw_happy_eye(right_x, eye_y);
+        draw_happy_eye(left_x, eye_y, s_current_gaze_x, s_current_gaze_y,
+                       eye_motion_x, eye_motion_y, eye_tilt);
+        draw_happy_eye(right_x, eye_y, s_current_gaze_x, s_current_gaze_y,
+                       eye_motion_x, eye_motion_y, eye_tilt);
     } else if (sad_eyes) {
-        draw_sad_eye(left_x, eye_y, gaze_y);
-        draw_sad_eye(right_x, eye_y, gaze_y);
+        draw_sad_eye(left_x, eye_y, s_current_gaze_y,
+                     eye_motion_x, eye_motion_y, eye_tilt);
+        draw_sad_eye(right_x, eye_y, s_current_gaze_y,
+                     eye_motion_x, eye_motion_y, eye_tilt);
     } else if (s_blink_phase != 0) {
         draw_blink_eye(left_x, eye_y, eye_open);
         draw_blink_eye(right_x, eye_y, eye_open);
     } else {
         const int openness = state == FACE_THINKING ? 13 : 14;
-        draw_open_eye(left_x, eye_y, gaze_x, gaze_y, 0, 0, openness);
-        draw_open_eye(right_x, eye_y, gaze_x, gaze_y, 0, 0, openness);
+        draw_open_eye(left_x, eye_y,
+                      clamp_i(gaze_x, -5, 5), clamp_i(gaze_y, -4, 4),
+                      eye_motion_x, eye_motion_y, openness, eye_tilt);
+        draw_open_eye(right_x, eye_y,
+                      clamp_i(gaze_x, -5, 5), clamp_i(gaze_y, -4, 4),
+                      eye_motion_x, eye_motion_y, openness, eye_tilt);
     }
 
-    const int brow_y = 14 + offset_y;
-    switch (state) {
-        case FACE_LISTENING:
-            draw_attentive_brow(left_x, brow_y);
-            draw_attentive_brow(right_x, brow_y);
-            break;
-        case FACE_THINKING:
-            draw_thinking_brow(left_x, brow_y, true);
-            draw_thinking_brow(right_x, brow_y, false);
-            break;
-        case FACE_SAD:
-            draw_sad_brow(left_x, brow_y, true);
-            draw_sad_brow(right_x, brow_y, false);
-            break;
-        case FACE_ERROR:
-            draw_normal_brow(left_x, brow_y, 3);
-            draw_normal_brow(right_x, brow_y, 3);
-            break;
-        case FACE_IDLE:
-            draw_normal_brow(left_x, brow_y, curious ? 2 : 0);
-            draw_normal_brow(right_x, brow_y, curious ? 2 : 0);
-            break;
-        default:
-            draw_normal_brow(left_x, brow_y, state == FACE_HAPPY ? 1 : 0);
-            draw_normal_brow(right_x, brow_y, state == FACE_HAPPY ? 1 : 0);
-            break;
+    // Eyebrows are now part of the active renderer. They use springs so
+    // expression changes ease into place instead of snapping.
+    if (state != FACE_SLEEP) {
+        const float brow_y_base = (float)eye_y;
+        const float brow_left_y = s_brow_left_y.current + offset_y * 0.15f;
+        const float brow_right_y = s_brow_right_y.current + offset_y * 0.15f;
+
+        draw_brow_physics((float)left_x, brow_y_base, 24.0f,
+                          s_brow_left_angle.current, brow_left_y);
+        draw_brow_physics((float)right_x, brow_y_base, 24.0f,
+                          s_brow_right_angle.current, brow_right_y);
     }
 
     if (state == FACE_HAPPY) {
@@ -622,19 +869,21 @@ static void render_face(uint32_t now_ms)
         for (int x = -10; x <= 10; ++x) {
             const float q = (float)x / 10.0f;
             const int y = (int)(5.0f * (1.0f - q * q));
-            pixel(64 + x, 53 + offset_y + y);
+            pixel(64 + x, 51 + offset_y + y);
         }
     } else if (state == FACE_SAD) {
-        line(55, 56 + offset_y, 64, 53 + offset_y);
-        line(64, 53 + offset_y, 73, 56 + offset_y);
+        line(55, 54 + offset_y, 64, 51 + offset_y);
+        line(64, 51 + offset_y, 73, 54 + offset_y);
     } else if (state == FACE_ERROR) {
-        line(57, 55 + offset_y, 62, 52 + offset_y);
-        line(62, 52 + offset_y, 67, 55 + offset_y);
-        line(67, 55 + offset_y, 72, 52 + offset_y);
+        line(57, 53 + offset_y, 62, 50 + offset_y);
+        line(62, 50 + offset_y, 67, 53 + offset_y);
+        line(67, 53 + offset_y, 72, 50 + offset_y);
     } else if (state == FACE_SLEEP) {
         draw_mouth(MOUTH_CLOSED, offset_y);
+    } else if (state == FACE_SPEAKING) {
+        draw_speaking_mouth(s_mouth_motion.current, offset_y);
     } else {
-        draw_mouth(state == FACE_SPEAKING ? s_mouth_shape : MOUTH_CLOSED, offset_y);
+        draw_mouth(MOUTH_CLOSED, offset_y);
     }
 }
 
@@ -666,9 +915,19 @@ void display_face_init(void)
     s_current_micro_y = 0;
     s_target_micro_x = 0;
     s_target_micro_y = 0;
+    s_eye_motion_x.reset(0.0f);
+    s_eye_motion_y.reset(0.0f);
+    s_pupil_motion_x.reset(0.0f);
+    s_pupil_motion_y.reset(0.0f);
+    s_brow_left_y.reset(-16.0f);
+    s_brow_right_y.reset(-16.0f);
+    s_brow_left_angle.reset(0.0f);
+    s_brow_right_angle.reset(0.0f);
+    s_last_motion_ms = now_ms;
     s_mouth_shape = MOUTH_CLOSED;
     s_mouth_shape_until_ms = now_ms;
     s_mouth_shape_count = 0;
+    s_mouth_motion.reset(0.04f);
     s_transition_started_ms = now_ms;
     s_transition_from = FACE_IDLE;
     s_transition_to = FACE_IDLE;
@@ -712,7 +971,12 @@ void display_face_set_state(face_state_t state)
     s_next_behavior_ms = now_ms + 350U;
     s_target_micro_x = 0;
     s_target_micro_y = 0;
-    if (state == FACE_SPEAKING) s_mouth_shape_until_ms = now_ms;
+    s_eye_motion_x.target = 0.0f;
+    s_eye_motion_y.target = 0.0f;
+    if (state == FACE_SPEAKING) {
+        s_mouth_shape_until_ms = now_ms;
+        s_mouth_shape_count = 0;
+    }
 }
 
 void display_face_show_for_ms(face_state_t state, uint32_t duration_ms)
@@ -748,72 +1012,6 @@ face_state_t display_face_get_state(void)
     state = s_current_face_state;
     portEXIT_CRITICAL(&s_face_state_mux);
     return state;
-}
-
-void display_face_render_mochi_gaze(int expr, int step,
-                                    int sX, int sY,
-                                    int gaze_x, int gaze_y,
-                                    int eye_shift_x, int eye_shift_y)
-{
-    memset(s_face_buffer, 0, sizeof(s_face_buffer));
-    draw_cat_ears(sY);
-    const int left_x = 34 + sX + eye_shift_x;
-    const int right_x = 94 + sX + eye_shift_x;
-    const int eye_y = 28 + sY + eye_shift_y;
-    if (expr == 6) {
-        draw_sad_brow(left_x, 14 + sY, true);
-        draw_sad_brow(right_x, 14 + sY, false);
-        draw_sad_eye(left_x, eye_y, gaze_y);
-        draw_sad_eye(right_x, eye_y, gaze_y);
-        draw_mouth(MOUTH_CLOSED, sY);
-    } else if (expr == 2 && step == 2) {
-        draw_happy_eye(left_x, eye_y);
-        draw_happy_eye(right_x, eye_y);
-        draw_normal_brow(left_x, 14 + sY, 1);
-        draw_normal_brow(right_x, 14 + sY, 1);
-        draw_mouth(MOUTH_MEDIUM, sY);
-    } else if (expr == 99) {
-        draw_error_eye(left_x, eye_y, 0);
-        draw_error_eye(right_x, eye_y, 0);
-        draw_normal_brow(left_x, 14 + sY, 3);
-        draw_normal_brow(right_x, 14 + sY, 3);
-        draw_mouth(MOUTH_MEDIUM, sY);
-    } else if (step == 3) {
-        draw_sleep_eye(left_x, eye_y, 1);
-        draw_sleep_eye(right_x, eye_y, 1);
-        draw_mouth(MOUTH_CLOSED, sY);
-    } else if (step == 1) {
-        draw_blink_eye(left_x, eye_y, 0);
-        draw_blink_eye(right_x, eye_y, 0);
-        draw_normal_brow(left_x, 14 + sY);
-        draw_normal_brow(right_x, 14 + sY);
-        draw_mouth(MOUTH_CLOSED, sY);
-    } else {
-        draw_open_eye(left_x, eye_y, gaze_x, gaze_y, 0, 0, expr == 1 ? 14 : 13);
-        draw_open_eye(right_x, eye_y, gaze_x, gaze_y, 0, 0, expr == 1 ? 14 : 13);
-        if (expr == 1) {
-            draw_attentive_brow(left_x, 14 + sY);
-            draw_attentive_brow(right_x, 14 + sY);
-            draw_mouth(MOUTH_SMALL, sY);
-        } else {
-            draw_normal_brow(left_x, 14 + sY);
-            draw_normal_brow(right_x, 14 + sY);
-            draw_mouth(MOUTH_CLOSED, sY);
-        }
-    }
-}
-
-void display_face_render_mochi(int expr, int step,
-                               int sX, int sY, int arahLirik)
-{
-    const int gaze = clamp_i(arahLirik, -7, 7);
-    display_face_render_mochi_gaze(expr, step, sX, sY, gaze, 0, 0, 0);
-}
-
-void display_face_render(void)
-{
-    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-    render_face(now_ms);
 }
 
 const uint8_t *display_face_buffer(void)
