@@ -254,6 +254,27 @@ static void wait_for_gemini_mic_release(void)
         ESP_LOGW(TAG, "MIC handoff: audio_task masih membaca setelah 100 ms");
 }
 
+/*
+ * A Gemini session must never leak into the next WakeWord cycle.
+ * After a session ends, wait for the websocket client cleanup worker to
+ * finish destroying the old client before accepting the next HI, ESP.
+ * This makes session 2/3/... follow the same fresh lifecycle as boot.
+ */
+static bool wait_for_websocket_idle(uint32_t timeout_ms)
+{
+    const uint32_t step_ms = 10;
+    const uint32_t max_steps = timeout_ms / step_ms;
+
+    for (uint32_t i = 0; i < max_steps; ++i) {
+        if (client == NULL)
+            return true;
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+    }
+
+    ESP_LOGW(TAG, "WebSocket lifecycle belum idle setelah %u ms", (unsigned)timeout_ms);
+    return client == NULL;
+}
+
 static void audio_task(void *arg)
 {
     (void)arg;
@@ -549,18 +570,35 @@ extern "C" void app_main()
                 while (afe_session_active)
                     vTaskDelay(pdMS_TO_TICKS(1));
 
+                /*
+                 * Return to the exact boot-ready lifecycle:
+                 * Gemini AFE is already deinitialized by audio_task above,
+                 * then close the old websocket and wait until its client is
+                 * actually destroyed before the next WakeWord cycle can
+                 * accept a new session.
+                 */
                 websocket_clear_standby_request();
+                websocket_disconnect();
+                (void)wait_for_websocket_idle(3000);
                 face_set_state(FACE_SLEEP);
                 display_status("Katakan: Hi, ESP");
-                websocket_disconnect();
                 last_user_activity_us = 0;
                 connect_start_us = 0;
-                ESP_LOGI(TAG, "Standby Gemini: WebSocket disconnected, Wake Word may resume");
+                ESP_LOGI(TAG, "Standby Gemini: old session fully released -> boot-ready lifecycle");
             }
         }
 
         if (!assistant_active) {
             if (wakeword_detected()) {
+                /*
+                 * Do not consume HI, ESP while the previous websocket client
+                 * is still being destroyed. Boot has no old client; every
+                 * subsequent session must wait for the same clean boundary.
+                 */
+                if (client != NULL) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                    continue;
+                }
                 wakeword_clear_detected();
                 wakeword_stop();
                 (void)audio_hal_stop_capture();
@@ -577,7 +615,7 @@ extern "C" void app_main()
                 face_set_state(FACE_HAPPY);
                 ESP_LOGI(TAG, "WAKEWORD detected -> conversation handoff");
                 websocket_app_start();
-            } else if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+            } else if (client == NULL && gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
                     while (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
