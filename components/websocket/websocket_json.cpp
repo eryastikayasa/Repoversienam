@@ -422,9 +422,10 @@ void process_gemini_message(const char *json, size_t len)
             /* Gemini has started producing the response. Keep THINKING visible
              * while model audio is being buffered; websocket_audio.cpp changes
              * to SPEAKING only when PCM actually reaches the playback path. */
-            if (!websocket_standby_requested())
+            if (!websocket_standby_requested()) {
                 display_face_set_state(FACE_THINKING);
                 display_text_set_status("Gemini berpikir...");
+            }
 
             cJSON *parts = cJSON_GetObjectItem(turn, "parts");
             if (cJSON_IsArray(parts)) {
