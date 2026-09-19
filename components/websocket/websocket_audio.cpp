@@ -85,7 +85,8 @@ void check_audio_playback_complete(void)
              (unsigned long long)audio_bytes_played,
              (unsigned long long)audio_bytes_dropped,
              (long long)balance);
-    display_face_set_state(FACE_LISTENING);
+    if (!websocket_standby_requested())
+        display_face_set_state(FACE_LISTENING);
 }
 
 static void audio_playback_task(void *arg)
@@ -170,7 +171,8 @@ static void audio_playback_task(void *arg)
 
         if (!playback_started) {
             playback_started = true;
-            display_face_set_state(FACE_SPEAKING);
+            if (!websocket_standby_requested())
+                display_face_set_state(FACE_SPEAKING);
         }
         underrun_reported = false;
         audio_write_speaker(playback_buffer, received);
