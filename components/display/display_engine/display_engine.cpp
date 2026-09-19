@@ -158,6 +158,7 @@ void display_engine_init(void)
     if (s_initialized) return;
     clear_final_frame();
     display_driver_init();
+    display_face_init();
     s_initialized = true;
 }
 
