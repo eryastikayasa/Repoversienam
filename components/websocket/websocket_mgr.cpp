@@ -284,12 +284,16 @@ void websocket_reset_started(void)
 
 void websocket_request_standby(void)
 {
+    /*
+     * This flag is raised only after standby_gemini has been acknowledged
+     * with toolResponse. Any audio turn that existed before the tool call
+     * is NOT the standby response and must never satisfy this state.
+     */
     standby_requested = true;
-    standby_response_started = audio_turn_active || audio_turn_complete_pending;
+    standby_response_started = false;
     standby_deadline_us = esp_timer_get_time() + STANDBY_RESPONSE_TIMEOUT_US;
     ESP_LOGI(TAG,
-             "Standby Gemini: shutdown_pending=1 response_started=%d deadline=5s",
-             standby_response_started ? 1 : 0);
+             "Standby Gemini: shutdown_pending=1 waiting for standby response, deadline=5s");
 }
 
 bool websocket_standby_requested(void)
