@@ -384,7 +384,8 @@ void process_gemini_message(const char *json, size_t len)
         /* Conversation is now ready: leave the wakeword/button HAPPY pose
          * and enter the normal listening state. The locked display renderer
          * remains untouched. */
-        display_face_set_state(FACE_LISTENING);
+        if (!websocket_standby_requested())
+            display_face_set_state(FACE_LISTENING);
         cJSON_Delete(root);
         return;
     }
@@ -421,7 +422,8 @@ void process_gemini_message(const char *json, size_t len)
             /* Gemini has started producing the response. Keep THINKING visible
              * while model audio is being buffered; websocket_audio.cpp changes
              * to SPEAKING only when PCM actually reaches the playback path. */
-            display_face_set_state(FACE_THINKING);
+            if (!websocket_standby_requested())
+                display_face_set_state(FACE_THINKING);
 
             cJSON *parts = cJSON_GetObjectItem(turn, "parts");
             if (cJSON_IsArray(parts)) {
