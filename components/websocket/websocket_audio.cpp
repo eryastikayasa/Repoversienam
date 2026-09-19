@@ -175,6 +175,34 @@ static void audio_playback_task(void *arg)
                 display_face_set_state(FACE_SPEAKING);
         }
         underrun_reported = false;
+
+        /*
+         * Speaker-path diagnostic only. Do not alter the PCM, timing, I2S,
+         * Audio HAL, or display path. This proves whether decoded Gemini PCM
+         * actually reaches the speaker boundary and whether the I2S writer
+         * is being called with non-zero audio.
+         */
+        if (audio_write_calls == 0) {
+            int16_t min_sample = 32767;
+            int16_t max_sample = -32768;
+            uint64_t sum_abs = 0;
+            const int16_t *samples = reinterpret_cast<const int16_t *>(playback_buffer);
+            const size_t sample_count = received / sizeof(int16_t);
+            for (size_t i = 0; i < sample_count; ++i) {
+                const int32_t s = samples[i];
+                if (s < min_sample) min_sample = static_cast<int16_t>(s);
+                if (s > max_sample) max_sample = static_cast<int16_t>(s);
+                sum_abs += static_cast<uint64_t>(s < 0 ? -s : s);
+            }
+            const uint32_t avg_abs = sample_count > 0
+                ? static_cast<uint32_t>(sum_abs / sample_count)
+                : 0;
+            ESP_LOGI(TAG,
+                     "SPEAKER PATH: PCM->I2S bytes=%u samples=%u min=%d max=%d avg_abs=%u",
+                     (unsigned)received, (unsigned)sample_count,
+                     (int)min_sample, (int)max_sample, (unsigned)avg_abs);
+        }
+
         audio_write_speaker(playback_buffer, received);
         audio_write_calls++;
         audio_bytes_played += received;
