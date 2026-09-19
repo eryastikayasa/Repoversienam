@@ -272,6 +272,16 @@ static void audio_task(void *arg)
 
     while (1) {
         if (!assistant_active) {
+            /*
+             * Session boundary: never carry PCM from the previous Gemini
+             * conversation into the next one. The AFE instance is kept alive
+             * for the lifetime of audio_task, so explicitly clear both the
+             * local staging state and any processed frames still queued by
+             * the asynchronous AFE fetch task.
+             */
+            buffer_pos = 0;
+            afe_staging_samples = 0;
+            afe_audio_flush_output();
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
