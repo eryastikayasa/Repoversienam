@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_timer.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -35,6 +36,9 @@ uint64_t audio_bytes_played = 0;
 uint64_t audio_bytes_dropped = 0;
 static volatile bool ws_started = false;
 static volatile bool standby_requested = false;
+static volatile bool standby_response_started = false;
+static volatile int64_t standby_deadline_us = 0;
+static constexpr int64_t STANDBY_RESPONSE_TIMEOUT_US = 5000000LL;
 QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
 QueueHandle_t websocket_rx_queue = NULL;
@@ -234,7 +238,7 @@ void websocket_app_start(void)
     if (!start_audio_playback()) return;
     clear_audio_buffer(); reset_audio_turn_stats(); reset_rx_buffer(); websocket_tx_flush_queue();
     if (!websocket_tx_init() || !websocket_rx_init()) return;
-    is_connected = false; setup_complete = false; websocket_tx_error = false; ws_started = false; standby_requested = false;
+    is_connected = false; setup_complete = false; websocket_tx_error = false; ws_started = false; standby_requested = false; standby_response_started = false; standby_deadline_us = 0;
     esp_websocket_client_config_t cfg = {};
     cfg.uri = WEBSOCKET_SERVER_URL;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -281,7 +285,11 @@ void websocket_reset_started(void)
 void websocket_request_standby(void)
 {
     standby_requested = true;
-    ESP_LOGI(TAG, "Standby Gemini diminta oleh tool");
+    standby_response_started = audio_turn_active || audio_turn_complete_pending;
+    standby_deadline_us = esp_timer_get_time() + STANDBY_RESPONSE_TIMEOUT_US;
+    ESP_LOGI(TAG,
+             "Standby Gemini: shutdown_pending=1 response_started=%d deadline=5s",
+             standby_response_started ? 1 : 0);
 }
 
 bool websocket_standby_requested(void)
@@ -289,7 +297,21 @@ bool websocket_standby_requested(void)
     return standby_requested;
 }
 
+bool websocket_standby_response_started(void)
+{
+    return standby_response_started;
+}
+
+bool websocket_standby_timeout_expired(void)
+{
+    return standby_requested &&
+           standby_deadline_us > 0 &&
+           esp_timer_get_time() >= standby_deadline_us;
+}
+
 void websocket_clear_standby_request(void)
 {
     standby_requested = false;
+    standby_response_started = false;
+    standby_deadline_us = 0;
 }
