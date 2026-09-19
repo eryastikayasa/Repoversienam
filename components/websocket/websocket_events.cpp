@@ -48,7 +48,8 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
             request_audio_buffer_clear();
-            display_text_set_status("AI Terhubung...");
+            display_face_set_state(FACE_THINKING);
+            display_text_set_status("Gemini terhubung...");
             websocket_schedule_setup(websocket_connection_generation);
             break;
 
@@ -108,7 +109,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
             request_audio_buffer_clear();
-            display_text_set_status("AI Disconnected");
+            display_text_set_status("AI terputus");
             if (session_resumable && session_handle[0] != '\0')
                 ESP_LOGI(TAG, "Session resumption handle dipertahankan");
             websocket_cleanup_pending = true;
