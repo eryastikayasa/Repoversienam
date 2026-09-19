@@ -306,12 +306,18 @@ static void process_gemini_tool_call(cJSON *tool_call)
 
         bool success = false;
         if (strcmp(name->valuestring, "standby_gemini") == 0) {
+            /*
+             * Mark shutdown-pending BEFORE returning the tool response. The
+             * tool response releases Gemini to produce the final acknowledgement;
+             * the main task will disconnect only after that response audio drains.
+             */
+            websocket_request_standby();
             success = websocket_send_tool_response(id->valuestring, name->valuestring, true);
             if (success) {
-                websocket_request_standby();
-                ESP_LOGI(TAG, "Gemini standby_gemini diterima: orderly shutdown diminta");
+                ESP_LOGI(TAG, "Gemini standby_gemini diterima: shutdown_pending, menunggu respons audio");
             } else {
-                ESP_LOGW(TAG, "Gemini standby_gemini: toolResponse gagal dikirim");
+                websocket_clear_standby_request();
+                ESP_LOGW(TAG, "Gemini standby_gemini: toolResponse gagal dikirim, standby dibatalkan");
             }
             continue;
         }
