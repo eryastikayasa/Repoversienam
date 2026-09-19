@@ -302,6 +302,12 @@ bool websocket_standby_response_started(void)
     return standby_response_started;
 }
 
+void websocket_mark_standby_response_started(void)
+{
+    if (standby_requested)
+        standby_response_started = true;
+}
+
 bool websocket_standby_timeout_expired(void)
 {
     return standby_requested &&
