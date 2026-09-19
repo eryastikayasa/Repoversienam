@@ -85,8 +85,10 @@ void check_audio_playback_complete(void)
              (unsigned long long)audio_bytes_played,
              (unsigned long long)audio_bytes_dropped,
              (long long)balance);
-    if (!websocket_standby_requested())
+    if (!websocket_standby_requested()) {
         display_face_set_state(FACE_LISTENING);
+        display_text_set_status("Silakan bicara...");
+    }
 }
 
 static void audio_playback_task(void *arg)
@@ -171,8 +173,10 @@ static void audio_playback_task(void *arg)
 
         if (!playback_started) {
             playback_started = true;
-            if (!websocket_standby_requested())
+            if (!websocket_standby_requested()) {
                 display_face_set_state(FACE_SPEAKING);
+                display_text_set_status("Gemini menjawab...");
+            }
         }
         underrun_reported = false;
 
