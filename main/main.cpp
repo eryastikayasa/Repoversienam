@@ -494,7 +494,7 @@ extern "C" void app_main()
 
     oled_init();
     face_animation_start();
-    face_set_state(FACE_SLEEP);
+    face_set_state(FACE_HAPPY);
     display_status("Booting...");
 
     audio_hal_init();
@@ -532,8 +532,8 @@ extern "C" void app_main()
 
     debug_network_path();
     vTaskDelay(pdMS_TO_TICKS(1000));
-    face_set_state(FACE_SLEEP);
-    display_status("Sistem siap. Katakan Hi, ESP...");
+    face_set_state(FACE_IDLE);
+    display_status("Katakan: Hi, ESP");
 
     BaseType_t task_result = xTaskCreate(
         audio_task, "audio_task", 10240, NULL, 5, NULL);
@@ -622,7 +622,8 @@ extern "C" void app_main()
                 assistant_active = true;
                 connect_start_us = esp_timer_get_time();
                 last_user_activity_us = connect_start_us;
-                face_set_state(FACE_HAPPY);
+                face_set_state(FACE_LISTENING);
+                display_status("Mendengarkan...");
                 ESP_LOGI(TAG, "WAKEWORD detected -> conversation handoff");
                 websocket_app_start();
             } else if (client == NULL && gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
@@ -650,7 +651,8 @@ extern "C" void app_main()
                     assistant_active = true;
                     connect_start_us = esp_timer_get_time();
                     last_user_activity_us = connect_start_us;
-                    face_set_state(FACE_HAPPY);
+                    face_set_state(FACE_LISTENING);
+                    display_status("Mendengarkan...");
                     websocket_app_start();
                 }
             } else if (!wakeword_is_running()) {
